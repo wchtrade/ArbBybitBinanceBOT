@@ -22,18 +22,24 @@ CHAT_ID = None
 
 config = {
     "min_profit_pct":  float(os.environ.get("MIN_PROFIT_PCT", "0.15")),
-    "lot_usdt":        float(os.environ.get("LOT_USDT", "100")),      # шаг лота
+    "lot_usdt":        float(os.environ.get("LOT_USDT", "100")),      # шаг лота, в USDT-эквиваленте для любой валюты котировки
     "start_capital":   float(os.environ.get("START_CAPITAL", "10000")),
     "stop_loss_usdt":  float(os.environ.get("STOP_LOSS_USDT", "50")),
     "scan_interval":   6,
     "simulation_mode": True,   # бот только симулирует, реальных ордеров нет — см. шапку файла
     "max_trades_per_min": int(os.environ.get("MAX_TRADES_PER_MIN", "5")),
+    "convert_threshold_usdt": float(os.environ.get("CONVERT_THRESHOLD_USDT", "20")),
 }
 
 # Стоп-лосс: при накопленном P&L <= -stop_loss_usdt торговля (запись в
 # P&L) приостанавливается, пока не отправишь /resume вручную.
 trading_paused = False
 pause_reason = ""
+
+# Валюты-мосты для арбитража: раньше сравнивались только пары COIN/USDT.
+# Теперь дополнительно сравниваются COIN/BTC и COIN/ETH между биржами —
+# это независимые от USDT-рынка стаканы, там тоже бывает рассинхрон.
+QUOTE_CURRENCIES = ["USDT", "BTC", "ETH"]
 
 # Bybit не используется — подтверждённо блокирует облачные IP
 # (Railway/AWS/GCP) через CloudFront (403), без VPS/прокси не лечится.
@@ -77,11 +83,21 @@ SYMBOLS = [
 ]
 QUOTE = "USDT"
 
-# Статистика по каждой монете — для /leaderboard (поиск кандидатов на реал)
+# Статистика по каждой монете (агрегат по всем валютам котировки) — для /leaderboard
 coin_stats: Dict[str, dict] = {
     s: {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0}
     for s in SYMBOLS
 }
+
+# Статистика по конкретным связкам (монета, валюта котировки) — для /pairs,
+# отвечает на вопрос "через какую валюту конкретно нашёлся арбитраж"
+pair_stats: Dict[tuple, dict] = {}
+
+# Накопители прибыли в НЕ-USDT валютах, ожидающие конвертации.
+# Как только эквивалент в USDT достигает convert_threshold_usdt — конвертируем
+# (прибавляем к stats["profit_sim"], сбрасываем накопитель, шлём уведомление).
+currency_balances: Dict[str, float] = {q: 0.0 for q in QUOTE_CURRENCIES if q != "USDT"}
+conversions_log: List[dict] = []
 
 stats = {
     "scans": 0, "signals": 0,
@@ -128,7 +144,12 @@ def check_trade_limit() -> bool:
 
 # ═══════════════════════════════════════
 # БИРЖИ: Binance, KuCoin, HTX
+# Возвращают Dict[(base, quote), {"bid":.., "ask":..}] — теперь не только
+# .../USDT, но и .../BTC, .../ETH (см. QUOTE_CURRENCIES)
 # ═══════════════════════════════════════
+
+_QUOTES_SORTED = sorted(QUOTE_CURRENCIES, key=len, reverse=True)  # длинные суффиксы (USDT) проверяем раньше коротких (BTC/ETH)
+
 
 async def get_binance(session) -> Dict:
     try:
@@ -138,13 +159,15 @@ async def get_binance(session) -> Dict:
             out = {}
             for item in await r.json():
                 sym = item.get("symbol", "")
-                if sym.endswith(QUOTE):
-                    base = sym[:-len(QUOTE)]
-                    if base in SYMBOLS:
-                        bid = float(item.get("bidPrice", 0) or 0)
-                        ask = float(item.get("askPrice", 0) or 0)
-                        if bid > 0 and ask > 0:
-                            out[base] = {"bid": bid, "ask": ask}
+                for q in _QUOTES_SORTED:
+                    if sym.endswith(q):
+                        base = sym[:-len(q)]
+                        if base in SYMBOLS and base != q:
+                            bid = float(item.get("bidPrice", 0) or 0)
+                            ask = float(item.get("askPrice", 0) or 0)
+                            if bid > 0 and ask > 0:
+                                out[(base, q)] = {"bid": bid, "ask": ask}
+                        break  # суффикс распознан (даже если base не в списке) — дальше не проверяем
             return out
     except Exception as e:
         logger.error(f"Binance: {e}")
@@ -159,13 +182,14 @@ async def get_kucoin(session) -> Dict:
             out = {}
             for item in (await r.json()).get("data", {}).get("ticker", []):
                 sym = item.get("symbol", "")
-                if sym.endswith(f"-{QUOTE}"):
-                    base = sym[:-len(f"-{QUOTE}")]
-                    if base in SYMBOLS:
-                        bid = float(item.get("buy", 0) or 0)
-                        ask = float(item.get("sell", 0) or 0)
-                        if bid > 0 and ask > 0:
-                            out[base] = {"bid": bid, "ask": ask}
+                if "-" not in sym:
+                    continue
+                base, _, quote = sym.partition("-")
+                if base in SYMBOLS and quote in QUOTE_CURRENCIES and base != quote:
+                    bid = float(item.get("buy", 0) or 0)
+                    ask = float(item.get("sell", 0) or 0)
+                    if bid > 0 and ask > 0:
+                        out[(base, quote)] = {"bid": bid, "ask": ask}
             return out
     except Exception as e:
         logger.error(f"KuCoin: {e}")
@@ -178,15 +202,18 @@ async def get_htx(session) -> Dict:
             "https://api.huobi.pro/market/tickers",
             timeout=aiohttp.ClientTimeout(total=8)) as r:
             out = {}
+            quotes_lower = [(q, q.lower()) for q in _QUOTES_SORTED]
             for item in (await r.json()).get("data", []):
                 sym = item.get("symbol", "")
-                if sym.endswith("usdt"):
-                    base = sym[:-4].upper()
-                    if base in SYMBOLS:
-                        bid = float(item.get("bid", 0) or 0)
-                        ask = float(item.get("ask", 0) or 0)
-                        if bid > 0 and ask > 0:
-                            out[base] = {"bid": bid, "ask": ask}
+                for q, q_lower in quotes_lower:
+                    if sym.endswith(q_lower):
+                        base = sym[:-len(q_lower)].upper()
+                        if base in SYMBOLS and base != q:
+                            bid = float(item.get("bid", 0) or 0)
+                            ask = float(item.get("ask", 0) or 0)
+                            if bid > 0 and ask > 0:
+                                out[(base, q)] = {"bid": bid, "ask": ask}
+                        break
             return out
     except Exception as e:
         logger.error(f"HTX: {e}")
@@ -197,15 +224,35 @@ async def get_htx(session) -> Dict:
 # АРБИТРАЖ
 # ═══════════════════════════════════════
 
-def find_arbitrage(all_data: Dict[str, Dict]) -> List[dict]:
-    results = []
-    vol = config["lot_usdt"]
-    min_pct = config["min_profit_pct"]
+def get_quote_usdt_rate(all_data, quote):
+    """Курс валюты котировки к USDT. Для USDT — всегда 1. Для BTC/ETH берём
+    среднюю ask-цену по парам (BTC,USDT)/(ETH,USDT) из уже собранных данных —
+    без отдельных запросов, эти монеты и так есть в основном списке SYMBOLS."""
+    if quote == "USDT":
+        return 1.0
+    entry = all_data.get((quote, "USDT"))
+    if not entry:
+        return None
+    asks = [d["ask"] for d in entry.values() if d.get("ask", 0) > 0]
+    if not asks:
+        return None
+    return sum(asks) / len(asks)
 
-    for symbol, exchanges in all_data.items():
+
+def find_arbitrage(all_data: Dict[tuple, Dict]) -> List[dict]:
+    results = []
+    min_pct = config["min_profit_pct"]
+    lot_usdt = config["lot_usdt"]
+
+    for (base, quote), exchanges in all_data.items():
         ex_list = list(exchanges.items())
         if len(ex_list) < 2:
             continue
+        quote_rate = get_quote_usdt_rate(all_data, quote)
+        if quote_rate is None:
+            continue  # нет курса quote→USDT в этом цикле — не можем размерить лот, пропускаем
+        vol_quote = lot_usdt / quote_rate  # лот в единицах валюты котировки, эквивалент ~lot_usdt
+
         for i in range(len(ex_list)):
             for j in range(len(ex_list)):
                 if i == j:
@@ -222,20 +269,25 @@ def find_arbitrage(all_data: Dict[str, Dict]) -> List[dict]:
                 net_pct   = gross_pct - buy_fee * 100 - sell_fee * 100
                 if net_pct < min_pct:
                     continue
-                coins  = vol / buy_price
-                profit = coins * sell_price * (1 - sell_fee) - vol * (1 + buy_fee)
+                coins = vol_quote / buy_price
+                profit_quote = coins * sell_price * (1 - sell_fee) - vol_quote * (1 + buy_fee)
+                profit_usdt = profit_quote * quote_rate
                 results.append({
-                    "symbol":      symbol,
-                    "buy_ex":      buy_ex,
-                    "sell_ex":     sell_ex,
-                    "buy_price":   buy_price,
-                    "sell_price":  sell_price,
-                    "gross_pct":   round(gross_pct, 4),
-                    "net_pct":     round(net_pct, 4),
-                    "profit_usdt": round(profit, 4),
-                    "coins":       round(coins, 6),
-                    "volume_usdt": vol,
-                    "time":        datetime.now().strftime("%H:%M:%S"),
+                    "symbol":       base,
+                    "quote":        quote,
+                    "buy_ex":       buy_ex,
+                    "sell_ex":      sell_ex,
+                    "buy_price":    buy_price,
+                    "sell_price":   sell_price,
+                    "gross_pct":    round(gross_pct, 4),
+                    "net_pct":      round(net_pct, 4),
+                    "profit_quote": round(profit_quote, 8),
+                    "profit_usdt":  round(profit_usdt, 4),
+                    "coins":        round(coins, 6),
+                    "volume_quote": round(vol_quote, 8),
+                    "volume_usdt":  lot_usdt,
+                    "quote_rate":   quote_rate,
+                    "time":         datetime.now().strftime("%H:%M:%S"),
                 })
 
     results.sort(key=lambda x: x["net_pct"], reverse=True)
@@ -243,25 +295,33 @@ def find_arbitrage(all_data: Dict[str, Dict]) -> List[dict]:
 
 
 def format_signal(opp: dict) -> str:
-    p1000 = round(opp["profit_usdt"] * 10, 2)
-    p5000 = round(opp["profit_usdt"] * 50, 2)
+    quote = opp["quote"]
+    p10 = round(opp["profit_usdt"] * 10, 2)
+    p50 = round(opp["profit_usdt"] * 50, 2)
+    if quote == "USDT":
+        profit_line = f"💰 *Прибыль на лот ({opp['volume_usdt']} USDT):* `~{opp['profit_usdt']} USDT`\n"
+    else:
+        profit_line = (
+            f"💰 *Прибыль на лот (~{opp['volume_usdt']} USDT в {quote}):* "
+            f"`~{opp['profit_quote']} {quote}` (`~{opp['profit_usdt']} USDT` по курсу {round(opp['quote_rate'],2)})\n"
+            f"   ⏳ Копится в балансе {quote}, конвертация в USDT — по достижении порога (см. /balances)\n"
+        )
     return (
         f"🚨 *АРБИТРАЖ: {opp['buy_ex']} → {opp['sell_ex']}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 СКРИНИНГ (симуляция)\n\n"
-        f"💱 *{opp['symbol']}/USDT*\n\n"
+        f"💱 *{opp['symbol']}/{quote}*\n\n"
         f"📥 *КУПИТЬ на {opp['buy_ex']}*\n"
-        f"   Цена: `{opp['buy_price']} USDT`\n"
-        f"   Лот: `{opp['volume_usdt']} USDT`\n"
+        f"   Цена: `{opp['buy_price']} {quote}`\n"
+        f"   Лот: `{opp['volume_quote']} {quote}` (~{opp['volume_usdt']} USDT)\n"
         f"   Получишь: `{opp['coins']} {opp['symbol']}`\n\n"
         f"📤 *ПРОДАТЬ на {opp['sell_ex']}*\n"
-        f"   Цена: `{opp['sell_price']} USDT`\n\n"
+        f"   Цена: `{opp['sell_price']} {quote}`\n\n"
         f"📊 *Расчёт:*\n"
         f"   Спред: `{opp['gross_pct']}%`\n"
         f"   После комиссий: `{opp['net_pct']}%`\n\n"
-        f"💰 *Прибыль на лот ({opp['volume_usdt']} USDT):* `~{opp['profit_usdt']} USDT`\n"
-        f"   x10 лотов → `~{p1000} USDT`\n"
-        f"   x50 лотов → `~{p5000} USDT`\n\n"
+        f"{profit_line}"
+        f"   x10 лотов → `~{p10} USDT` | x50 лотов → `~{p50} USDT`\n\n"
         f"⚠️ Цена актуальна только сейчас!\n\n"
         f"🕐 {opp['time']}"
     )
@@ -277,7 +337,7 @@ async def fetch_all(session):
         return_exceptions=True
     )
     ex_names = ["Binance", "KuCoin", "HTX"]
-    all_data: Dict[str, Dict] = {}
+    all_data: Dict[tuple, Dict] = {}
     active = []
     counts = {}
 
@@ -287,10 +347,10 @@ async def fetch_all(session):
             continue
         active.append(ex_name)
         counts[ex_name] = len(result)
-        for symbol, price_data in result.items():
-            all_data.setdefault(symbol, {})[ex_name] = price_data
+        for pair, price_data in result.items():
+            all_data.setdefault(pair, {})[ex_name] = price_data
 
-    logger.info(f"Монет с биржи: {counts}")
+    logger.info(f"Пар с биржи: {counts}")
     return all_data, active
 
 
@@ -306,6 +366,11 @@ async def scan_cycle(session):
             cs = coin_stats.setdefault(o["symbol"], {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
             cs["signals"] += 1
             cs["best_net_pct"] = max(cs["best_net_pct"], o["net_pct"])
+
+            pk = (o["symbol"], o["quote"])
+            ps = pair_stats.setdefault(pk, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+            ps["signals"] += 1
+            ps["best_net_pct"] = max(ps["best_net_pct"], o["net_pct"])
     return opps, active
 
 
@@ -318,29 +383,64 @@ async def execute_sim(opp: dict, session=None):
         logger.info(f"Trade limit reached ({config['max_trades_per_min']}/min), skipping")
         return
 
+    quote = opp["quote"]
     trade = {
         "id":          len(trade_history) + 1,
         "time":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "symbol":      opp["symbol"],
+        "quote":       quote,
         "buy_ex":      opp["buy_ex"],
         "sell_ex":     opp["sell_ex"],
         "buy_price":   opp["buy_price"],
         "sell_price":  opp["sell_price"],
         "net_pct":     opp["net_pct"],
         "profit_usdt": opp["profit_usdt"],
+        "profit_quote": opp["profit_quote"],
     }
     trade_history.append(trade)
     stats["trades_sim"]        += 1
-    stats["profit_sim"]        += opp["profit_usdt"]
     stats["trades_this_minute"] += 1
 
     cs = coin_stats.setdefault(opp["symbol"], {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
     cs["trades"] += 1
-    cs["profit_usdt"] += opp["profit_usdt"]
+    cs["profit_usdt"] += opp["profit_usdt"]  # для лидерборда всегда в USDT-эквиваленте, для сравнимости монет между собой
+
+    pk = (opp["symbol"], quote)
+    ps = pair_stats.setdefault(pk, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+    ps["trades"] += 1
+    ps["profit_usdt"] += opp["profit_usdt"]
+
+    if quote == "USDT":
+        # прибыль уже в USDT — сразу в реализованный P&L, без накопителя
+        stats["profit_sim"] += opp["profit_usdt"]
+    else:
+        # прибыль в BTC/ETH — копится в отдельном балансе до порога конвертации
+        currency_balances[quote] = currency_balances.get(quote, 0.0) + opp["profit_quote"]
+        pending_value_usdt = currency_balances[quote] * opp["quote_rate"]
+        logger.info(f"Накоплено в {quote}: {round(currency_balances[quote], 8)} (~{round(pending_value_usdt, 2)} USDT)")
+
+        if pending_value_usdt >= config["convert_threshold_usdt"]:
+            converted_amount = currency_balances[quote]
+            converted_usdt = pending_value_usdt
+            currency_balances[quote] = 0.0
+            stats["profit_sim"] += converted_usdt
+            conversions_log.append({
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "currency": quote, "amount": round(converted_amount, 8),
+                "usdt_value": round(converted_usdt, 4), "rate": opp["quote_rate"],
+            })
+            logger.info(f"КОНВЕРТАЦИЯ: {round(converted_amount,8)} {quote} → {round(converted_usdt,4)} USDT")
+            if session is not None:
+                await send_tg(session,
+                    f"💱 *Автоконвертация*\n"
+                    f"Накопилось `{round(converted_amount, 8)} {quote}` (~`{round(converted_usdt, 2)} USDT`) — "
+                    f"порог `{config['convert_threshold_usdt']} USDT` достигнут, конвертировано в USDT.\n"
+                    f"Курс: `1 {quote} = {round(opp['quote_rate'], 2)} USDT`"
+                )
 
     logger.info(
-        f"SIM #{trade['id']}: {opp['symbol']} {opp['buy_ex']}→{opp['sell_ex']} "
-        f"+{opp['net_pct']}% +{opp['profit_usdt']} USDT "
+        f"SIM #{trade['id']}: {opp['symbol']}/{quote} {opp['buy_ex']}→{opp['sell_ex']} "
+        f"+{opp['net_pct']}% +{opp['profit_quote']} {quote} (~{opp['profit_usdt']} USDT) "
         f"[{stats['trades_this_minute']}/{config['max_trades_per_min']} этой минуты]"
     )
 
@@ -373,17 +473,21 @@ async def handle_command(session, text, chat_id):
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Назначение: СКРИНИНГ — искать новые монеты для будущей реальной торговли.\n"
             f"Площадки: Binance, KuCoin, HTX\n"
-            f"Монет в скрининге: {len(SYMBOLS)}\n\n"
+            f"Монет в скрининге: {len(SYMBOLS)}\n"
+            f"Валюты котировки: {', '.join(QUOTE_CURRENCIES)} (не только USDT — ещё COIN/BTC и COIN/ETH)\n\n"
             f"⚙️ Стартовый капитал (справочно): `{config['start_capital']} USDT`\n"
-            f"⚙️ Лот/шаг сделки: `{config['lot_usdt']} USDT`\n"
+            f"⚙️ Лот/шаг сделки: `{config['lot_usdt']} USDT`-эквивалент\n"
             f"⚙️ Стоп-лосс: `-{config['stop_loss_usdt']} USDT` (только `/resume` включает обратно)\n"
             f"⚙️ Порог маржи: `{config['min_profit_pct']}%`\n"
+            f"⚙️ Порог автоконвертации BTC/ETH→USDT: `{config['convert_threshold_usdt']} USDT`\n"
             f"⚙️ Лимит: `{config['max_trades_per_min']} сделок/мин`\n\n"
             f"/scan — скан сейчас\n"
-            f"/top — топ пар по спреду\n"
-            f"/prices SYMBOL — цены по конкретной монете на всех биржах\n"
+            f"/top — топ пар по спреду (по всем валютам котировки)\n"
+            f"/prices SYMBOL — цены по монете на всех биржах и валютах котировки\n"
             f"/exchanges — диагностика бирж\n"
-            f"/leaderboard — рейтинг монет-кандидатов на реал\n"
+            f"/leaderboard — рейтинг монет-кандидатов на реал (агрегат по всем валютам)\n"
+            f"/pairs — рейтинг конкретных связок монета/валюта\n"
+            f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика\n"
             f"/history — последние сделки\n"
             f"/resume — снять паузу после стоп-лосса\n"
@@ -419,13 +523,17 @@ async def handle_command(session, text, chat_id):
             if isinstance(r, Exception):
                 msg += f"❌ {name}: исключение `{r}`\n"
             elif not r:
-                msg += f"⚠️ {name}: 0 монет (проверь сеть/гео-блок)\n"
+                msg += f"⚠️ {name}: 0 пар (проверь сеть/гео-блок)\n"
             else:
-                msg += f"✅ {name}: {len(r)} монет из {len(SYMBOLS)} в списке\n"
+                by_quote = {}
+                for (base, quote) in r.keys():
+                    by_quote[quote] = by_quote.get(quote, 0) + 1
+                breakdown = ", ".join(f"{q}:{n}" for q, n in by_quote.items())
+                msg += f"✅ {name}: {len(r)} пар всего ({breakdown})\n"
         await send_tg(session, msg)
 
     elif cmd == "/top":
-        await send_tg(session, "📊 Ищу лучшие пары по всем 3 биржам...")
+        await send_tg(session, "📊 Ищу лучшие пары по всем 3 биржам и всем валютам котировки...")
         all_data, active = await fetch_all(session)
         if len(active) < 2:
             await send_tg(session, "❌ Недостаточно активных бирж.")
@@ -438,12 +546,12 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Нет данных вообще ни по одной паре.")
             return
         msg = f"📊 *ТОП-20 — {datetime.now().strftime('%H:%M:%S')}*\n"
-        msg += f"Бирж: {', '.join(active)} | Монет с данными: {len(all_data)}\n"
+        msg += f"Бирж: {', '.join(active)} | Пар с данными: {len(all_data)}\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for i, opp in enumerate(opps[:20], 1):
             icon = "🟢" if opp["net_pct"] >= config["min_profit_pct"] else "🔴"
             msg += (
-                f"{icon} *{i}. {opp['symbol']}* {opp['buy_ex']}→{opp['sell_ex']}\n"
+                f"{icon} *{i}. {opp['symbol']}/{opp['quote']}* {opp['buy_ex']}→{opp['sell_ex']}\n"
                 f"   Спред: `{opp['gross_pct']}%` | Чистая: `{opp['net_pct']}%`\n"
             )
         msg += f"\n_Порог сигнала: {config['min_profit_pct']}%_"
@@ -451,7 +559,7 @@ async def handle_command(session, text, chat_id):
 
     elif cmd == "/prices":
         if len(parts) < 2:
-            await send_tg(session, "Пример: `/prices BTC`\nСписок всех монет — /exchanges покажет количество, а не список.")
+            await send_tg(session, "Пример: `/prices BTC`")
             return
         sym = parts[1].upper()
         if sym not in SYMBOLS:
@@ -459,14 +567,19 @@ async def handle_command(session, text, chat_id):
             return
         await send_tg(session, f"📊 Получаю цены по {sym}...")
         all_data, active = await fetch_all(session)
-        ex_data = all_data.get(sym, {})
-        msg = f"📊 *{sym}/USDT — {datetime.now().strftime('%H:%M:%S')}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        for ex in ("Binance", "KuCoin", "HTX"):
-            if ex in ex_data:
-                d = ex_data[ex]
-                msg += f"{ex}: bid `{d['bid']}` / ask `{d['ask']}`\n"
-            else:
-                msg += f"⚠️ {ex}: нет данных по этой монете\n"
+        msg = f"📊 *{sym} — {datetime.now().strftime('%H:%M:%S')}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for quote in QUOTE_CURRENCIES:
+            if quote == sym:
+                continue
+            ex_data = all_data.get((sym, quote), {})
+            msg += f"*{sym}/{quote}:*\n"
+            for ex in ("Binance", "KuCoin", "HTX"):
+                if ex in ex_data:
+                    d = ex_data[ex]
+                    msg += f"  {ex}: bid `{d['bid']}` / ask `{d['ask']}`\n"
+                else:
+                    msg += f"  ⚠️ {ex}: нет данных\n"
+            msg += "\n"
         await send_tg(session, msg)
 
     elif cmd == "/leaderboard":
@@ -475,18 +588,49 @@ async def handle_command(session, text, chat_id):
         if not ranked:
             await send_tg(session, "Пока нет ни одного сигнала ни по одной монете. Дай боту поработать подольше или снизь /setprofit.")
             return
-        msg = "🏆 *РЕЙТИНГ КАНДИДАТОВ НА РЕАЛ*\n(сортировка по количеству сигналов)\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg = "🏆 *РЕЙТИНГ КАНДИДАТОВ НА РЕАЛ*\n(агрегат по всем валютам котировки, сортировка по числу сигналов)\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for i, (sym, cs) in enumerate(ranked, 1):
             msg += (
                 f"{i}. *{sym}* — сигналов: `{cs['signals']}` | сделок: `{cs['trades']}` | "
                 f"P&L: `{round(cs['profit_usdt'],3)} USDT` | лучшая маржа: `{cs['best_net_pct']}%`\n"
             )
+        msg += "\n_Через какую именно валюту (USDT/BTC/ETH) — смотри /pairs_"
+        await send_tg(session, msg)
+
+    elif cmd == "/pairs":
+        ranked = sorted(pair_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
+        ranked = [r for r in ranked if r[1]["signals"] > 0][:25]
+        if not ranked:
+            await send_tg(session, "Пока нет сигналов ни по одной связке монета/валюта.")
+            return
+        msg = "🔗 *РЕЙТИНГ СВЯЗОК МОНЕТА/ВАЛЮТА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for i, ((sym, quote), ps) in enumerate(ranked, 1):
+            msg += (
+                f"{i}. *{sym}/{quote}* — сигналов: `{ps['signals']}` | сделок: `{ps['trades']}` | "
+                f"P&L: `{round(ps['profit_usdt'],3)} USDT` | лучшая маржа: `{ps['best_net_pct']}%`\n"
+            )
+        await send_tg(session, msg)
+
+    elif cmd == "/balances":
+        pending = {q: b for q, b in currency_balances.items() if b > 0}
+        msg = "💰 *НАКОПЛЕННЫЕ БАЛАНСЫ (ждут конвертации в USDT)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        if not pending:
+            msg += "Пусто — либо ещё не было сделок в BTC/ETH-парах, либо всё уже сконвертировано.\n"
+        else:
+            for q, amt in pending.items():
+                msg += f"*{q}:* `{round(amt, 8)}` (порог конвертации: {config['convert_threshold_usdt']} USDT)\n"
+        if conversions_log:
+            msg += f"\n📜 *Последние конвертации ({len(conversions_log)} всего):*\n"
+            for c in conversions_log[-5:][::-1]:
+                msg += f"  {c['time']}: {c['amount']} {c['currency']} → {c['usdt_value']} USDT\n"
         await send_tg(session, msg)
 
     elif cmd == "/stats":
         uptime = datetime.now() - stats["start_time"]
         h = int(uptime.total_seconds() // 3600)
         m = int((uptime.total_seconds() % 3600) // 60)
+        pending = {q: b for q, b in currency_balances.items() if b > 0}
+        pending_line = ", ".join(f"{round(b,6)} {q}" for q, b in pending.items()) if pending else "нет"
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🛑 Стоп-лосс: {'*АКТИВЕН — торговля на паузе*' if trading_paused else 'не сработал'}\n"
@@ -494,16 +638,20 @@ async def handle_command(session, text, chat_id):
             f"🔍 Сканов: {stats['scans']}\n"
             f"🎯 Сигналов: {stats['signals']}\n"
             f"✅ Сделок (симуляция): {stats['trades_sim']}\n"
-            f"💰 Прибыль (симуляция): {round(stats['profit_sim'], 4)} USDT\n"
+            f"💰 Прибыль реализованная (сконвертирована в USDT): {round(stats['profit_sim'], 4)} USDT\n"
+            f"⏳ Ожидает конвертации: {pending_line}\n"
+            f"🔄 Конвертаций всего: {len(conversions_log)}\n"
             f"❌ Ошибок: {stats['errors']}\n\n"
             f"⏱ Сделок этой минуты: {stats['trades_this_minute']}/{config['max_trades_per_min']}\n\n"
             f"⚙️ Стартовый капитал: {config['start_capital']} USDT\n"
-            f"⚙️ Лот: {config['lot_usdt']} USDT\n"
-            f"⚙️ Стоп-лосс: -{config['stop_loss_usdt']} USDT\n"
+            f"⚙️ Лот: {config['lot_usdt']} USDT-эквивалент\n"
+            f"⚙️ Стоп-лосс: -{config['stop_loss_usdt']} USDT (считается по реализованному P&L)\n"
             f"⚙️ Порог маржи: {config['min_profit_pct']}%\n"
+            f"⚙️ Порог автоконвертации: {config['convert_threshold_usdt']} USDT\n"
             f"⚙️ Монет в скрининге: {len(SYMBOLS)}\n"
+            f"⚙️ Валюты котировки: {', '.join(QUOTE_CURRENCIES)}\n"
             f"⚙️ Бирж: 3 (Binance/KuCoin/HTX)\n\n"
-            f"/leaderboard — какие монеты реально сработали"
+            f"/leaderboard — какие монеты реально сработали | /pairs — через какую валюту | /balances — детали накоплений"
         )
 
     elif cmd == "/history":
@@ -513,8 +661,8 @@ async def handle_command(session, text, chat_id):
         msg = "📋 *ПОСЛЕДНИЕ СДЕЛКИ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for t in trade_history[-10:][::-1]:
             msg += (
-                f"#{t['id']} *{t['symbol']}* {t['buy_ex']}→{t['sell_ex']}\n"
-                f"   +{t['net_pct']}% | +{t['profit_usdt']} USDT | {t['time']}\n\n"
+                f"#{t['id']} *{t['symbol']}/{t['quote']}* {t['buy_ex']}→{t['sell_ex']}\n"
+                f"   +{t['net_pct']}% | +{t['profit_quote']} {t['quote']} (~{t['profit_usdt']} USDT) | {t['time']}\n\n"
             )
         await send_tg(session, msg)
 
@@ -552,7 +700,8 @@ async def handle_command(session, text, chat_id):
 
     else:
         await send_tg(session,
-            "/start /scan /top /prices SYMBOL /exchanges /leaderboard\n"
+            "/start /scan /top /prices SYMBOL /exchanges\n"
+            "/leaderboard /pairs /balances\n"
             "/stats /history /resume\n"
             "/setprofit 0.15 /setlot 100"
         )
@@ -584,7 +733,7 @@ async def scan_loop(session):
             opps, active = await scan_cycle(session)
             logger.info(f"Scan #{stats['scans']}: {len(active)} бирж, {len(opps)} сигналов")
             for opp in opps[:5]:
-                key = f"{opp['symbol']}-{opp['buy_ex']}-{opp['sell_ex']}"
+                key = f"{opp['symbol']}-{opp['quote']}-{opp['buy_ex']}-{opp['sell_ex']}"
                 now = datetime.now().timestamp()
                 if now - last_signal_time.get(key, 0) > 120:
                     last_signal_time[key] = now
