@@ -93,6 +93,11 @@ coin_stats: Dict[str, dict] = {
 # отвечает на вопрос "через какую валюту конкретно нашёлся арбитраж"
 pair_stats: Dict[tuple, dict] = {}
 
+# Статистика по маршрутам биржа→биржа (независимо от монеты) — отвечает
+# на вопрос "между какими конкретно биржами арбитраж встречается чаще
+# и с какой маржой", для /routes
+route_stats: Dict[tuple, dict] = {}
+
 # Накопители прибыли в НЕ-USDT валютах, ожидающие конвертации.
 # Как только эквивалент в USDT достигает convert_threshold_usdt — конвертируем
 # (прибавляем к stats["profit_sim"], сбрасываем накопитель, шлём уведомление).
@@ -371,6 +376,12 @@ async def scan_cycle(session):
             ps = pair_stats.setdefault(pk, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
             ps["signals"] += 1
             ps["best_net_pct"] = max(ps["best_net_pct"], o["net_pct"])
+
+            rk = (o["buy_ex"], o["sell_ex"])
+            rs = route_stats.setdefault(rk, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0, "coins": set()})
+            rs["signals"] += 1
+            rs["best_net_pct"] = max(rs["best_net_pct"], o["net_pct"])
+            rs["coins"].add(f"{o['symbol']}/{o['quote']}")
     return opps, active
 
 
@@ -409,6 +420,12 @@ async def execute_sim(opp: dict, session=None):
     ps = pair_stats.setdefault(pk, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
     ps["trades"] += 1
     ps["profit_usdt"] += opp["profit_usdt"]
+
+    rk = (opp["buy_ex"], opp["sell_ex"])
+    rs = route_stats.setdefault(rk, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0, "coins": set()})
+    rs["trades"] += 1
+    rs["profit_usdt"] += opp["profit_usdt"]
+    rs["coins"].add(f"{opp['symbol']}/{quote}")
 
     if quote == "USDT":
         # прибыль уже в USDT — сразу в реализованный P&L, без накопителя
@@ -487,10 +504,12 @@ async def handle_command(session, text, chat_id):
             f"/exchanges — диагностика бирж\n"
             f"/leaderboard — рейтинг монет-кандидатов на реал (агрегат по всем валютам)\n"
             f"/pairs — рейтинг конкретных связок монета/валюта\n"
+            f"/routes — рейтинг маршрутов биржа→биржа (где арбитраж чаще всего)\n"
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика\n"
             f"/history — последние сделки\n"
-            f"/resume — снять паузу после стоп-лосса\n"
+            f"/pause — приостановить торговлю вручную\n"
+            f"/resume — снять паузу (ручную или после стоп-лосса)\n"
             f"/setprofit 0.15 — порог маржи\n"
             f"/setlot 100 — изменить размер лота\n"
         )
@@ -611,6 +630,26 @@ async def handle_command(session, text, chat_id):
             )
         await send_tg(session, msg)
 
+    elif cmd == "/routes":
+        ranked = sorted(route_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
+        ranked = [r for r in ranked if r[1]["signals"] > 0]
+        if not ranked:
+            await send_tg(session, "Пока нет сигналов ни по одному маршруту биржа→биржа.")
+            return
+        msg = "🛣 *РЕЙТИНГ МАРШРУТОВ (биржа → биржа)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for i, ((buy_ex, sell_ex), rs) in enumerate(ranked, 1):
+            example_coins = ", ".join(list(rs["coins"])[:5])
+            more = f" и ещё {len(rs['coins'])-5}" if len(rs["coins"]) > 5 else ""
+            msg += (
+                f"{i}. *{buy_ex} → {sell_ex}*\n"
+                f"   Сигналов: `{rs['signals']}` | Сделок: `{rs['trades']}` | "
+                f"P&L: `{round(rs['profit_usdt'],3)} USDT` | Лучшая маржа: `{rs['best_net_pct']}%`\n"
+                f"   Монеты: {example_coins}{more}\n\n"
+            )
+        msg += "_Показывает, между какими конкретно биржами арбитраж встречается чаще всего — независимо от монеты._"
+        await send_tg(session, msg)
+
+
     elif cmd == "/balances":
         pending = {q: b for q, b in currency_balances.items() if b > 0}
         msg = "💰 *НАКОПЛЕННЫЕ БАЛАНСЫ (ждут конвертации в USDT)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -633,7 +672,7 @@ async def handle_command(session, text, chat_id):
         pending_line = ", ".join(f"{round(b,6)} {q}" for q, b in pending.items()) if pending else "нет"
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🛑 Стоп-лосс: {'*АКТИВЕН — торговля на паузе*' if trading_paused else 'не сработал'}\n"
+            f"⏸ Пауза: {('*ДА* — ' + pause_reason) if trading_paused else 'нет'}\n"
             f"Аптайм: {h}ч {m}м\n\n"
             f"🔍 Сканов: {stats['scans']}\n"
             f"🎯 Сигналов: {stats['signals']}\n"
@@ -665,6 +704,18 @@ async def handle_command(session, text, chat_id):
                 f"   +{t['net_pct']}% | +{t['profit_quote']} {t['quote']} (~{t['profit_usdt']} USDT) | {t['time']}\n\n"
             )
         await send_tg(session, msg)
+
+    elif cmd == "/pause":
+        if trading_paused:
+            await send_tg(session, f"⏸ Уже на паузе: {pause_reason}\nВключить обратно — /resume.")
+        else:
+            trading_paused = True
+            pause_reason = "ручная пауза (/pause)"
+            await send_tg(session,
+                "⏸ *Торговля приостановлена вручную*\n"
+                "Сканирование и сигналы продолжаются как обычно, но новые сделки в P&L не пишутся.\n"
+                "Включить обратно — `/resume`."
+            )
 
     elif cmd == "/resume":
         if not trading_paused:
@@ -701,8 +752,8 @@ async def handle_command(session, text, chat_id):
     else:
         await send_tg(session,
             "/start /scan /top /prices SYMBOL /exchanges\n"
-            "/leaderboard /pairs /balances\n"
-            "/stats /history /resume\n"
+            "/leaderboard /pairs /routes /balances\n"
+            "/stats /history /pause /resume\n"
             "/setprofit 0.15 /setlot 100"
         )
 
