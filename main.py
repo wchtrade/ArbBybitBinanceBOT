@@ -115,6 +115,8 @@ conversions_log: List[dict] = []
 stats = {
     "scans": 0, "signals": 0,
     "trades_sim": 0, "profit_sim": 0.0,
+    "profit_since_resume": 0.0,  # обнуляется в /resume — именно это сравнивается со стоп-лоссом,
+                                  # чтобы после включения бот не выключался обратно на первой же сделке
     "errors": 0, "start_time": datetime.now(),
     "trades_this_minute": 0,
     "minute_start": datetime.now(),
@@ -438,6 +440,7 @@ async def execute_sim(opp: dict, session=None):
     if quote == "USDT":
         # прибыль уже в USDT — сразу в реализованный P&L, без накопителя
         stats["profit_sim"] += opp["profit_usdt"]
+        stats["profit_since_resume"] += opp["profit_usdt"]
     else:
         # прибыль в BTC/ETH — копится в отдельном балансе до порога конвертации
         currency_balances[quote] = currency_balances.get(quote, 0.0) + opp["profit_quote"]
@@ -449,6 +452,7 @@ async def execute_sim(opp: dict, session=None):
             converted_usdt = pending_value_usdt
             currency_balances[quote] = 0.0
             stats["profit_sim"] += converted_usdt
+            stats["profit_since_resume"] += converted_usdt
             conversions_log.append({
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "currency": quote, "amount": round(converted_amount, 8),
@@ -469,14 +473,15 @@ async def execute_sim(opp: dict, session=None):
         f"[{stats['trades_this_minute']}/{config['max_trades_per_min']} этой минуты]"
     )
 
-    if stats["profit_sim"] <= -config["stop_loss_usdt"]:
+    if stats["profit_since_resume"] <= -config["stop_loss_usdt"]:
         trading_paused = True
-        pause_reason = f"стоп-лосс {config['stop_loss_usdt']} USDT достигнут (P&L: {round(stats['profit_sim'], 2)})"
+        pause_reason = f"стоп-лосс {config['stop_loss_usdt']} USDT достигнут (P&L с последнего запуска: {round(stats['profit_since_resume'], 2)})"
         logger.warning(f"СТОП-ЛОСС СРАБОТАЛ: {pause_reason}")
         if session is not None:
             await send_tg(session,
                 f"🛑 *СТОП-ЛОСС СРАБОТАЛ*\n"
-                f"Накопленный P&L: `{round(stats['profit_sim'], 2)} USDT` (лимит: -{config['stop_loss_usdt']} USDT)\n\n"
+                f"P&L с последнего включения: `{round(stats['profit_since_resume'], 2)} USDT` (лимит: -{config['stop_loss_usdt']} USDT)\n"
+                f"Общий P&L за всё время: `{round(stats['profit_sim'], 2)} USDT`\n\n"
                 f"Сканирование остановлено полностью, новых сигналов не будет.\n"
                 f"Включить обратно — команда `/resume`."
             )
@@ -689,7 +694,8 @@ async def handle_command(session, text, chat_id):
             f"🔍 Сканов: {stats['scans']}\n"
             f"🎯 Сигналов: {stats['signals']}\n"
             f"✅ Сделок (симуляция): {stats['trades_sim']}\n"
-            f"💰 Прибыль реализованная (сконвертирована в USDT): {round(stats['profit_sim'], 4)} USDT\n"
+            f"💰 Прибыль реализованная (за всё время): {round(stats['profit_sim'], 4)} USDT\n"
+            f"💰 P&L с последнего /resume (сравнивается со стоп-лоссом): {round(stats['profit_since_resume'], 4)} USDT\n"
             f"⏳ Ожидает конвертации: {pending_line}\n"
             f"🔄 Конвертаций всего: {len(conversions_log)}\n"
             f"❌ Ошибок: {stats['errors']}\n\n"
@@ -736,9 +742,10 @@ async def handle_command(session, text, chat_id):
             trading_paused = False
             old_reason = pause_reason
             pause_reason = ""
+            stats["profit_since_resume"] = 0.0  # иначе стоп-лосс сработает заново на первой же сделке
             await send_tg(session,
                 f"▶️ *Торговля возобновлена вручную*\nБыла на паузе из-за: {old_reason}\n"
-                f"P&L симуляции НЕ сброшен."
+                f"Счётчик стоп-лосса обнулён (общий P&L за всё время — `{round(stats['profit_sim'], 2)} USDT` — НЕ сброшен)."
             )
 
     elif cmd == "/setprofit":
@@ -891,7 +898,11 @@ async def handle_command(session, text, chat_id):
             real_trading_paused = False
             old = real_pause_reason
             real_pause_reason = ""
-            await send_tg(session, f"▶️ Реальная торговля возобновлена. Была на паузе: {old}")
+            real_stats["pnl_since_resume"] = 0.0  # иначе стоп-лосс сработает заново на первой же сделке
+            await send_tg(session,
+                f"▶️ Реальная торговля возобновлена. Была на паузе: {old}\n"
+                f"Счётчик стоп-лосса обнулён (P&L за сегодня — `{round(real_stats['pnl_today_usdt'],4)} USDT` — НЕ сброшен)."
+            )
 
     elif cmd == "/realstatus":
         reset_real_day_if_needed()
@@ -903,7 +914,8 @@ async def handle_command(session, text, chat_id):
             f"Монеты: {', '.join(REAL_SYMBOLS) or '(пусто)'}\n"
             f"Маршруты: {', '.join(f'{b}→{s}' for b, s in PAIRS)}\n\n"
             f"Сделок сегодня: {real_stats['trades_today']}/{real_config['max_trades_per_day']}\n"
-            f"P&L сегодня: {round(real_stats['pnl_today_usdt'],4)} USDT (стоп-лосс -{real_config['daily_stop_loss_usdt']})\n"
+            f"P&L сегодня: {round(real_stats['pnl_today_usdt'],4)} USDT\n"
+            f"P&L с последнего /realresume (сравнивается со стоп-лоссом): {round(real_stats['pnl_since_resume'],4)} USDT (лимит -{real_config['daily_stop_loss_usdt']})\n"
             f"Автодокупок: {real_stats['topups']} | Ошибок: {real_stats['errors']}\n\n"
             f"Лот: {real_config['max_real_order_usdt']} USDT | Буфер: {real_config['balance_safety_buffer_pct']}% | "
             f"Headroom: {real_config['rebalance_headroom_pct']}%\n"
@@ -1035,6 +1047,7 @@ real_stats = {
     "day": datetime.now().strftime("%Y-%m-%d"),
     "trades_today": 0,
     "pnl_today_usdt": 0.0,
+    "pnl_since_resume": 0.0,  # обнуляется в /realresume и при смене дня — именно это сравнивается со стоп-лоссом
     "topups": 0,
     "errors": 0,
     "trades_this_minute": 0,
@@ -1588,6 +1601,7 @@ def reset_real_day_if_needed():
         real_stats["day"] = today
         real_stats["trades_today"] = 0
         real_stats["pnl_today_usdt"] = 0.0
+        real_stats["pnl_since_resume"] = 0.0
 
 
 def check_real_trade_limits() -> Optional[str]:
@@ -1601,8 +1615,8 @@ def check_real_trade_limits() -> Optional[str]:
         return f"лимит {config['max_trades_per_min']} сделок/мин"
     if real_stats["trades_today"] >= real_config["max_trades_per_day"]:
         return f"дневной лимит {real_config['max_trades_per_day']} сделок"
-    if real_stats["pnl_today_usdt"] <= -real_config["daily_stop_loss_usdt"]:
-        return f"дневной стоп-лосс -{real_config['daily_stop_loss_usdt']} USDT"
+    if real_stats["pnl_since_resume"] <= -real_config["daily_stop_loss_usdt"]:
+        return f"стоп-лосс -{real_config['daily_stop_loss_usdt']} USDT (с последнего /realresume)"
     return None
 
 
@@ -1740,6 +1754,7 @@ async def execute_real_arbitrage(session, opp: dict) -> Tuple[bool, str]:
     real_stats["trades_today"] += 1
     real_stats["trades_this_minute"] += 1
     real_stats["pnl_today_usdt"] += profit_usdt
+    real_stats["pnl_since_resume"] += profit_usdt
 
     real_trade_history.append({
         "id": len(real_trade_history) + 1,
@@ -1749,9 +1764,9 @@ async def execute_real_arbitrage(session, opp: dict) -> Tuple[bool, str]:
         "net_pct_expected": opp["net_pct"],
     })
 
-    if real_stats["pnl_today_usdt"] <= -real_config["daily_stop_loss_usdt"]:
+    if real_stats["pnl_since_resume"] <= -real_config["daily_stop_loss_usdt"]:
         real_trading_paused = True
-        real_pause_reason = f"дневной стоп-лосс -{real_config['daily_stop_loss_usdt']} USDT достигнут"
+        real_pause_reason = f"стоп-лосс -{real_config['daily_stop_loss_usdt']} USDT достигнут (с последнего /realresume)"
 
     return True, f"✅ Исполнено: {actual_qty} {base}, {buy_ex}→{sell_ex}, факт. профит ~{profit_usdt} USDT"
 
