@@ -469,7 +469,7 @@ async def execute_sim(opp: dict, session=None):
             await send_tg(session,
                 f"🛑 *СТОП-ЛОСС СРАБОТАЛ*\n"
                 f"Накопленный P&L: `{round(stats['profit_sim'], 2)} USDT` (лимит: -{config['stop_loss_usdt']} USDT)\n\n"
-                f"Исполнение сделок приостановлено. Сигналы дальше — только справочно.\n"
+                f"Сканирование остановлено полностью, новых сигналов не будет.\n"
                 f"Включить обратно — команда `/resume`."
             )
 
@@ -515,6 +515,9 @@ async def handle_command(session, text, chat_id):
         )
 
     elif cmd == "/scan":
+        if trading_paused:
+            await send_tg(session, f"⏸ Бот на паузе: {pause_reason}\nСигналы не показываются. Включить обратно — /resume.")
+            return
         await send_tg(session, f"🔍 Сканирую 3 биржи, {len(SYMBOLS)} монет...")
         opps, active = await scan_cycle(session)
         if not opps:
@@ -713,7 +716,7 @@ async def handle_command(session, text, chat_id):
             pause_reason = "ручная пауза (/pause)"
             await send_tg(session,
                 "⏸ *Торговля приостановлена вручную*\n"
-                "Сканирование и сигналы продолжаются как обычно, но новые сделки в P&L не пишутся.\n"
+                "Сканирование остановлено полностью — новых сигналов в чат не будет, пока не снимешь паузу.\n"
                 "Включить обратно — `/resume`."
             )
 
@@ -780,10 +783,15 @@ async def polling_loop(session):
 async def scan_loop(session):
     await asyncio.sleep(15)
     while True:
+        if trading_paused:
+            await asyncio.sleep(config["scan_interval"])
+            continue
         try:
             opps, active = await scan_cycle(session)
             logger.info(f"Scan #{stats['scans']}: {len(active)} бирж, {len(opps)} сигналов")
             for opp in opps[:5]:
+                if trading_paused:  # могло смениться прямо во время обработки списка сигналов
+                    break
                 key = f"{opp['symbol']}-{opp['quote']}-{opp['buy_ex']}-{opp['sell_ex']}"
                 now = datetime.now().timestamp()
                 if now - last_signal_time.get(key, 0) > 120:
