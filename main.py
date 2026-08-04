@@ -130,9 +130,21 @@ async def send_tg(session, text):
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        await session.post(url, json={
+        async with session.post(url, json={
             "chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"
-        }, timeout=aiohttp.ClientTimeout(total=10))
+        }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                body = await r.text()
+                logger.error(f"TG sendMessage HTTP {r.status}: {body}")
+                # Частая причина 400 — несбалансированная разметка Markdown
+                # в динамически собранном тексте. Повторяем тем же текстом,
+                # но уже без parse_mode, чтобы сообщение всё равно дошло,
+                # а не терялось молча.
+                async with session.post(url, json={
+                    "chat_id": CHAT_ID, "text": text
+                }, timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                    if r2.status != 200:
+                        logger.error(f"TG sendMessage повтор без Markdown тоже не прошёл: HTTP {r2.status}: {await r2.text()}")
     except Exception as e:
         logger.error(f"TG: {e}")
 
