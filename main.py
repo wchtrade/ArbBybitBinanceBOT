@@ -532,7 +532,7 @@ async def handle_command(session, text, chat_id):
             f"Назначение: мониторинг арбитражных возможностей по {len(SYMBOLS)} монетам: {', '.join(SYMBOLS)}\n"
             f"Площадки: Binance, KuCoin, HTX\n"
             f"Валюты котировки: {', '.join(QUOTE_CURRENCIES)} (не только USDT — ещё COIN/BTC и COIN/ETH)\n"
-            f"Режим: {'работает НЕПРЕРЫВНО — автопауза по стоп-лоссу выключена, только уведомление' if not config['auto_pause_on_stop_loss'] else 'автопауза по стоп-лоссу включена (ARB_AUTO_PAUSE=YES)'}\n\n"
+            f"Режим: работает НЕПРЕРЫВНО — без пауз, стоп-лосс только уведомляет\n\n"
             f"⚙️ Стартовый капитал (справочно): `{config['start_capital']} USDT`\n"
             f"⚙️ Лот/шаг сделки: `{config['lot_usdt']} USDT`-эквивалент\n"
             f"⚙️ Стоп-лосс (уведомление): `-{config['stop_loss_usdt']} USDT`\n"
@@ -1072,7 +1072,14 @@ async def polling_loop(session):
                 chat_id = msg["chat"]["id"]
                 text = msg.get("text", "")
                 if text.startswith("/"):
-                    await handle_command(session, text, chat_id)
+                    try:
+                        await handle_command(session, text, chat_id)
+                    except Exception as e:
+                        logger.error(f"handle_command упал на '{text}': {e}")
+                        try:
+                            await send_tg(session, f"⚠️ Ошибка при обработке `{text.split()[0]}`: `{e}`\nБот продолжает работать, напиши другую команду.")
+                        except Exception:
+                            pass
         await asyncio.sleep(1)
 
 
@@ -2017,7 +2024,10 @@ async def real_scan_loop(session):
 async def real_rebalance_background_loop(session):
     await asyncio.sleep(60)
     while True:
-        await maybe_auto_rebalance(session, reason="плановый (раз в ~30 мин)")
+        try:
+            await maybe_auto_rebalance(session, reason="плановый (раз в ~30 мин)")
+        except Exception as e:
+            logger.error(f"real_rebalance_background_loop error: {e}")
         await asyncio.sleep(1800)
 
 
@@ -2041,12 +2051,21 @@ async def main():
             await init_real_filters(session)
         except Exception as e:
             logger.error(f"init_real_filters: {e}")
-        await asyncio.gather(
+        results = await asyncio.gather(
             polling_loop(session),
             scan_loop(session),
             real_scan_loop(session),
             real_rebalance_background_loop(session),
+            return_exceptions=True,
         )
+        # Эти циклы обычные — while True, они не должны возвращаться сами.
+        # Если какой-то всё же завершился (упал с необработанным исключением
+        # где-то внутри), логируем явно — иначе бот молча остаётся без,
+        # например, обработки команд, и непонятно, что случилось.
+        names = ["polling_loop", "scan_loop", "real_scan_loop", "real_rebalance_background_loop"]
+        for name, result in zip(names, results):
+            if isinstance(result, Exception):
+                logger.error(f"Фоновая задача {name} упала с исключением: {result}")
 
 
 if __name__ == "__main__":
