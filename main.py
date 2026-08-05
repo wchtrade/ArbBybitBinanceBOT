@@ -29,7 +29,7 @@ CHAT_ID = None
 # ══════════════════════════════════════════════════════════════
 
 config = {
-    "min_profit_pct":  float(os.environ.get("MIN_PROFIT_PCT", "0.15")),
+    "min_profit_pct":  float(os.environ.get("MIN_PROFIT_PCT", "0.3")),
     "lot_usdt":        float(os.environ.get("LOT_USDT", "100")),      # шаг лота, в USDT-эквиваленте для любой валюты котировки
     "start_capital":   float(os.environ.get("START_CAPITAL", "10000")),
     "stop_loss_usdt":  float(os.environ.get("STOP_LOSS_USDT", "50")),
@@ -37,18 +37,20 @@ config = {
     "simulation_mode": True,   # бот только симулирует, реальных ордеров нет — см. шапку файла
     "max_trades_per_min": int(os.environ.get("MAX_TRADES_PER_MIN", "5")),
     "convert_threshold_usdt": float(os.environ.get("CONVERT_THRESHOLD_USDT", "20")),
-    # По умолчанию ВЫКЛЮЧЕНО — бот работает непрерывно, без автопауз по
-    # стоп-лоссу симуляции. Стоп-лосс продолжает считаться и сообщается в
-    # /stats и уведомлением при достижении, но сканирование не останавливает.
-    # Ручная /pause /resume по-прежнему доступны, если захочешь остановить
-    # сам. Включить автопаузу обратно — ARB_AUTO_PAUSE=YES.
-    "auto_pause_on_stop_loss": os.environ.get("ARB_AUTO_PAUSE", "").upper() == "YES",
 }
 
-# Стоп-лосс: при накопленном P&L <= -stop_loss_usdt торговля (запись в
-# P&L) приостанавливается, пока не отправишь /resume вручную.
-trading_paused = False
-pause_reason = ""
+# Система паузы убрана по запросу — бот всегда сканирует и присылает
+# сигналы, без /pause и /resume и без автопаузы по стоп-лоссу. Стоп-лосс
+# по-прежнему считается и присылает разовое уведомление при достижении
+# (см. execute_sim), но никогда не останавливает сканирование.
+# Реальная торговля (/realpause /realresume) — отдельная система для
+# защиты настоящих денег, её это не касается.
+
+# Подозрительно большой спред (в %) — почти наверняка рассинхрон/задержка
+# данных между биржами, а не настоящая возможность. Такие сигналы всё
+# равно показываются, но с явным предупреждением, а не как надёжный сигнал.
+SUSPICIOUS_SPREAD_PCT = 10.0
+
 
 # Валюты-мосты для арбитража: раньше сравнивались только пары COIN/USDT.
 # Теперь дополнительно сравниваются COIN/BTC и COIN/ETH между биржами —
@@ -123,8 +125,8 @@ conversions_log: List[dict] = []
 stats = {
     "scans": 0, "signals": 0,
     "trades_sim": 0, "profit_sim": 0.0,
-    "profit_since_resume": 0.0,  # обнуляется в /resume — именно это сравнивается со стоп-лоссом,
-                                  # чтобы после включения бот не выключался обратно на первой же сделке
+    "profit_since_alert": 0.0,  # обнуляется после каждого уведомления о стоп-лоссе,
+                                 # чтобы не слать одно и то же оповещение на каждой следующей сделке
     "errors": 0, "start_time": datetime.now(),
     "trades_this_minute": 0,
     "minute_start": datetime.now(),
@@ -341,6 +343,13 @@ def format_signal(opp: dict) -> str:
             f"`~{opp['profit_quote']} {quote}` (`~{opp['profit_usdt']} USDT` по курсу {round(opp['quote_rate'],2)})\n"
             f"   ⏳ Копится в балансе {quote}, конвертация в USDT — по достижении порога (см. /balances)\n"
         )
+    warning = ""
+    if opp["gross_pct"] >= SUSPICIOUS_SPREAD_PCT:
+        warning = (
+            f"\n⚠️⚠️ *Спред {opp['gross_pct']}% ОЧЕНЬ большой для этих бирж — скорее всего "
+            f"устаревшие/рассинхронные данные, а не настоящая возможность.*\n"
+            f"Проверь `/depthcheck {opp['symbol']}` прежде чем доверять этой цифре.\n"
+        )
     return (
         f"🚨 *АРБИТРАЖ: {opp['buy_ex']} → {opp['sell_ex']}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -354,7 +363,8 @@ def format_signal(opp: dict) -> str:
         f"   Цена: `{opp['sell_price']} {quote}`\n\n"
         f"📊 *Расчёт:*\n"
         f"   Спред: `{opp['gross_pct']}%`\n"
-        f"   После комиссий: `{opp['net_pct']}%`\n\n"
+        f"   После комиссий: `{opp['net_pct']}%`\n"
+        f"{warning}\n"
         f"{profit_line}"
         f"   x10 лотов → `~{p10} USDT` | x50 лотов → `~{p50} USDT`\n\n"
         f"⚠️ Цена актуальна только сейчас!\n\n"
@@ -416,10 +426,6 @@ async def scan_cycle(session):
 
 
 async def execute_sim(opp: dict, session=None):
-    global trading_paused, pause_reason
-    if trading_paused:
-        logger.info(f"Пропуск сделки — торговля на паузе ({pause_reason})")
-        return
     if not check_trade_limit():
         logger.info(f"Trade limit reached ({config['max_trades_per_min']}/min), skipping")
         return
@@ -460,7 +466,7 @@ async def execute_sim(opp: dict, session=None):
     if quote == "USDT":
         # прибыль уже в USDT — сразу в реализованный P&L, без накопителя
         stats["profit_sim"] += opp["profit_usdt"]
-        stats["profit_since_resume"] += opp["profit_usdt"]
+        stats["profit_since_alert"] += opp["profit_usdt"]
     else:
         # прибыль в BTC/ETH — копится в отдельном балансе до порога конвертации
         currency_balances[quote] = currency_balances.get(quote, 0.0) + opp["profit_quote"]
@@ -472,7 +478,7 @@ async def execute_sim(opp: dict, session=None):
             converted_usdt = pending_value_usdt
             currency_balances[quote] = 0.0
             stats["profit_sim"] += converted_usdt
-            stats["profit_since_resume"] += converted_usdt
+            stats["profit_since_alert"] += converted_usdt
             conversions_log.append({
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "currency": quote, "amount": round(converted_amount, 8),
@@ -493,33 +499,19 @@ async def execute_sim(opp: dict, session=None):
         f"[{stats['trades_this_minute']}/{config['max_trades_per_min']} этой минуты]"
     )
 
-    if stats["profit_since_resume"] <= -config["stop_loss_usdt"]:
-        pnl_line = (
-            f"P&L с последнего включения: `{round(stats['profit_since_resume'], 2)} USDT` (лимит: -{config['stop_loss_usdt']} USDT)\n"
-            f"Общий P&L за всё время: `{round(stats['profit_sim'], 2)} USDT`\n\n"
-        )
-        if config["auto_pause_on_stop_loss"]:
-            trading_paused = True
-            pause_reason = f"стоп-лосс {config['stop_loss_usdt']} USDT достигнут (P&L с последнего запуска: {round(stats['profit_since_resume'], 2)})"
-            logger.warning(f"СТОП-ЛОСС СРАБОТАЛ: {pause_reason}")
-            if session is not None:
-                await send_tg(session,
-                    f"🛑 *СТОП-ЛОСС СРАБОТАЛ*\n{pnl_line}"
-                    f"Сканирование остановлено полностью, новых сигналов не будет.\n"
-                    f"Включить обратно — команда `/resume`."
-                )
-        else:
-            # Бот настроен работать непрерывно (по умолчанию) — только
-            # уведомляем и сбрасываем счётчик "с последнего включения",
-            # чтобы не спамить одним и тем же уведомлением каждую сделку.
-            logger.warning(f"Стоп-лосс достигнут (P&L с последнего сброса: {round(stats['profit_since_resume'], 2)}), но авто-пауза выключена — продолжаю сканировать")
-            if session is not None:
-                await send_tg(session,
-                    f"⚠️ *Стоп-лосс достигнут* (но авто-пауза выключена — работаю дальше)\n{pnl_line}"
-                    f"Хочешь, чтобы бот останавливался автоматически — задай ARB_AUTO_PAUSE=YES.\n"
-                    f"Остановить вручную прямо сейчас — команда `/pause`."
-                )
-            stats["profit_since_resume"] = 0.0
+    # Стоп-лосс здесь НИКОГДА не останавливает сканирование — только разовое
+    # уведомление при пересечении порога, потом счётчик "с последнего
+    # уведомления" сбрасывается, чтобы не спамить одним и тем же на каждой
+    # следующей сделке.
+    if stats["profit_since_alert"] <= -config["stop_loss_usdt"]:
+        logger.warning(f"Стоп-лосс достигнут (P&L с последнего уведомления: {round(stats['profit_since_alert'], 2)})")
+        if session is not None:
+            await send_tg(session,
+                f"⚠️ *Стоп-лосс достигнут* (бот работает дальше без остановки)\n"
+                f"P&L с последнего уведомления: `{round(stats['profit_since_alert'], 2)} USDT` (порог: -{config['stop_loss_usdt']} USDT)\n"
+                f"Общий P&L за всё время: `{round(stats['profit_sim'], 2)} USDT`"
+            )
+        stats["profit_since_alert"] = 0.0
 
 
 # ═══════════════════════════════════════
@@ -527,7 +519,7 @@ async def execute_sim(opp: dict, session=None):
 # ═══════════════════════════════════════
 
 async def handle_command(session, text, chat_id):
-    global CHAT_ID, trading_paused, pause_reason
+    global CHAT_ID
     global real_trading_paused, real_pause_reason, _confirm_real_runtime
     CHAT_ID = chat_id
     parts = text.strip().split()
@@ -547,7 +539,7 @@ async def handle_command(session, text, chat_id):
             f"⚙️ Порог маржи: `{config['min_profit_pct']}%`\n"
             f"⚙️ Порог автоконвертации BTC/ETH→USDT: `{config['convert_threshold_usdt']} USDT`\n"
             f"⚙️ Лимит: `{config['max_trades_per_min']} сделок/мин`\n\n"
-            f"/report — сводный отчёт: цены, спред, статистика по каждой монете\n"
+            f"/report — топ-5 монет по сигналам: цены, спред, статистика\n"
             f"/scan — скан сейчас\n"
             f"/top — топ пар по спреду (по всем валютам котировки)\n"
             f"/prices SYMBOL — цены по монете на всех биржах и валютах котировки\n"
@@ -559,16 +551,11 @@ async def handle_command(session, text, chat_id):
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика\n"
             f"/history — последние сделки\n"
-            f"/pause — приостановить вручную (бот сам не останавливается)\n"
-            f"/resume — снять паузу\n"
             f"/setprofit 0.15 — порог маржи\n"
             f"/setlot 100 — изменить размер лота\n"
         )
 
     elif cmd == "/scan":
-        if trading_paused:
-            await send_tg(session, f"⏸ Бот на паузе: {pause_reason}\nСигналы не показываются. Включить обратно — /resume.")
-            return
         await send_tg(session, f"🔍 Сканирую 3 биржи, {len(SYMBOLS)} монет...")
         opps, active = await scan_cycle(session)
         if not opps:
@@ -623,11 +610,12 @@ async def handle_command(session, text, chat_id):
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for i, opp in enumerate(opps[:20], 1):
             icon = "🟢" if opp["net_pct"] >= config["min_profit_pct"] else "🔴"
+            suspicious = " ⚠️" if opp["gross_pct"] >= SUSPICIOUS_SPREAD_PCT else ""
             msg += (
                 f"{icon} *{i}. {opp['symbol']}/{opp['quote']}* {opp['buy_ex']}→{opp['sell_ex']}\n"
-                f"   Спред: `{opp['gross_pct']}%` | Чистая: `{opp['net_pct']}%`\n"
+                f"   Спред: `{opp['gross_pct']}%` | Чистая: `{opp['net_pct']}%`{suspicious}\n"
             )
-        msg += f"\n_Порог сигнала: {config['min_profit_pct']}%_"
+        msg += f"\n_Порог сигнала: {saved}% | ⚠️ = спред ≥{SUSPICIOUS_SPREAD_PCT}%, вероятно рассинхрон данных, не настоящая возможность_"
         await send_tg(session, msg)
 
     elif cmd == "/prices":
@@ -710,63 +698,59 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/report":
-        await send_tg(session, f"📊 Собираю сводный отчёт по {len(SYMBOLS)} монетам (может занять немного времени)...")
+        await send_tg(session, "📊 Собираю отчёт по топ-5 монетам, которые лучше всего показывают сигналы...")
         all_data, active = await fetch_all(session)
         saved_threshold = config["min_profit_pct"]
         config["min_profit_pct"] = -999
         all_opps = find_arbitrage(all_data)
         config["min_profit_pct"] = saved_threshold
 
-        header = (
-            f"📈 *ОТЧЁТ ПО МОНЕТАМ — {datetime.now().strftime('%H:%M:%S')}*\n"
-            f"Бирж активно: {len(active)} ({', '.join(active)}) | Монет: {len(SYMBOLS)}\n"
+        # Топ-5 = сначала монеты, у которых уже были реальные сигналы за
+        # сессию (сортировка по числу сигналов), остаток мест — монеты с
+        # лучшим спредом прямо сейчас, если по каким-то ещё не было сигналов.
+        by_signals = sorted(coin_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
+        top_coins = [c for c, cs in by_signals if cs["signals"] > 0][:5]
+        if len(top_coins) < 5:
+            live_ranked = sorted(SYMBOLS, key=lambda c: max(
+                [o["net_pct"] for o in all_opps if o["symbol"] == c], default=-999
+            ), reverse=True)
+            for c in live_ranked:
+                if c not in top_coins:
+                    top_coins.append(c)
+                if len(top_coins) >= 5:
+                    break
+
+        msg = (
+            f"📈 *ТОП-5 МОНЕТ ПО СИГНАЛАМ — {datetime.now().strftime('%H:%M:%S')}*\n"
+            f"Бирж активно: {len(active)} ({', '.join(active)})\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
 
-        blocks = []
-        for coin in SYMBOLS:
-            block = f"💱 *{coin}*\n"
+        for coin in top_coins:
+            msg += f"💱 *{coin}*\n"
             usdt_data = all_data.get((coin, "USDT"), {})
             if usdt_data:
                 prices = " | ".join(f"{ex}: `{d['bid']}`/`{d['ask']}`" for ex, d in usdt_data.items())
-                block += f"   Цены (bid/ask): {prices}\n"
+                msg += f"   Цены (bid/ask): {prices}\n"
             else:
-                block += "   ⚠️ Нет данных USDT ни с одной биржи прямо сейчас\n"
+                msg += "   ⚠️ Нет данных USDT ни с одной биржи прямо сейчас\n"
 
             coin_opps = [o for o in all_opps if o["symbol"] == coin]
             if coin_opps:
                 best = coin_opps[0]
                 icon = "🟢" if best["net_pct"] >= saved_threshold else "🔴"
-                block += (f"   {icon} Лучший спред сейчас: {best['buy_ex']}→{best['sell_ex']} "
-                          f"через {best['quote']}, чистая маржа `{best['net_pct']}%`\n")
+                suspicious = " ⚠️ *подозрительно большой спред — вероятно устаревшие/рассинхронные данные, не доверяй не глядя, проверь /depthcheck*" if best["gross_pct"] >= SUSPICIOUS_SPREAD_PCT else ""
+                msg += (f"   {icon} Лучший спред сейчас: {best['buy_ex']}→{best['sell_ex']} "
+                        f"через {best['quote']}, чистая маржа `{best['net_pct']}%`{suspicious}\n")
             else:
-                block += "   Спреда сейчас не найдено ни по одной паре котировки\n"
+                msg += "   Спреда сейчас не найдено ни по одной паре котировки\n"
 
             cs = coin_stats.get(coin, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
-            block += (f"   За сессию: сигналов `{cs['signals']}`, сделок `{cs['trades']}`, "
-                      f"P&L `{round(cs['profit_usdt'],4)} USDT`, лучшая маржа `{cs['best_net_pct']}%`\n\n")
-            blocks.append(block)
+            msg += (f"   За сессию: сигналов `{cs['signals']}`, сделок `{cs['trades']}`, "
+                    f"P&L `{round(cs['profit_usdt'],4)} USDT`, лучшая маржа `{cs['best_net_pct']}%`\n\n")
 
-        # Разбиваем на сообщения по ~3500 символов (запас от лимита Telegram
-        # в 4096), чтобы отчёт по широкому списку монет не падал целиком
-        # из-за превышения длины — каждая часть уходит отдельным сообщением.
-        MAX_CHUNK = 3500
-        chunks = []
-        current = header
-        for block in blocks:
-            if len(current) + len(block) > MAX_CHUNK:
-                chunks.append(current)
-                current = ""
-            current += block
-        if current.strip():
-            chunks.append(current)
-
-        total = len(chunks)
-        for i, chunk in enumerate(chunks, 1):
-            suffix = f"\n_Часть {i}/{total}_" if total > 1 else ""
-            await send_tg(session, chunk + suffix)
-
-        await send_tg(session, f"_Порог сигнала: {saved_threshold}% | Полная детализация — /pairs, /routes_")
+        msg += f"_Порог сигнала: {saved_threshold}% | Полный список ({len(SYMBOLS)} монет) — /leaderboard, /pairs, /routes_"
+        await send_tg(session, msg)
 
     elif cmd == "/leaderboard":
         ranked = sorted(coin_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
@@ -839,14 +823,13 @@ async def handle_command(session, text, chat_id):
         pending_line = ", ".join(f"{round(b,6)} {q}" for q, b in pending.items()) if pending else "нет"
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"⏸ Пауза: {('*ДА* — ' + pause_reason) if trading_paused else 'нет'}\n"
-            f"🔁 Автопауза по стоп-лоссу: {'включена' if config['auto_pause_on_stop_loss'] else 'выключена — бот работает непрерывно'}\n"
+            f"▶️ Работает непрерывно, без пауз\n"
             f"Аптайм: {h}ч {m}м\n\n"
             f"🔍 Сканов: {stats['scans']}\n"
             f"🎯 Сигналов: {stats['signals']}\n"
             f"✅ Сделок (симуляция): {stats['trades_sim']}\n"
             f"💰 Прибыль реализованная (за всё время): {round(stats['profit_sim'], 4)} USDT\n"
-            f"💰 P&L с последнего /resume (сравнивается со стоп-лоссом): {round(stats['profit_since_resume'], 4)} USDT\n"
+            f"💰 P&L с последнего уведомления о стоп-лоссе: {round(stats['profit_since_alert'], 4)} USDT\n"
             f"⏳ Ожидает конвертации: {pending_line}\n"
             f"🔄 Конвертаций всего: {len(conversions_log)}\n"
             f"❌ Ошибок: {stats['errors']}\n\n"
@@ -873,31 +856,6 @@ async def handle_command(session, text, chat_id):
                 f"   +{t['net_pct']}% | +{t['profit_quote']} {t['quote']} (~{t['profit_usdt']} USDT) | {t['time']}\n\n"
             )
         await send_tg(session, msg)
-
-    elif cmd == "/pause":
-        if trading_paused:
-            await send_tg(session, f"⏸ Уже на паузе: {pause_reason}\nВключить обратно — /resume.")
-        else:
-            trading_paused = True
-            pause_reason = "ручная пауза (/pause)"
-            await send_tg(session,
-                "⏸ *Торговля приостановлена вручную*\n"
-                "Сканирование остановлено полностью — новых сигналов в чат не будет, пока не снимешь паузу.\n"
-                "Включить обратно — `/resume`."
-            )
-
-    elif cmd == "/resume":
-        if not trading_paused:
-            await send_tg(session, "✅ Торговля и так не на паузе — стоп-лосс не срабатывал.")
-        else:
-            trading_paused = False
-            old_reason = pause_reason
-            pause_reason = ""
-            stats["profit_since_resume"] = 0.0  # иначе стоп-лосс сработает заново на первой же сделке
-            await send_tg(session,
-                f"▶️ *Торговля возобновлена вручную*\nБыла на паузе из-за: {old_reason}\n"
-                f"Счётчик стоп-лосса обнулён (общий P&L за всё время — `{round(stats['profit_sim'], 2)} USDT` — НЕ сброшен)."
-            )
 
     elif cmd == "/setprofit":
         if len(parts) < 2:
@@ -1089,7 +1047,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session,
             "/start /report /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
             "/leaderboard /pairs /routes /balances\n"
-            "/stats /history /pause /resume\n"
+            "/stats /history\n"
             "/setprofit 0.15 /setlot 100\n\n"
             "🔴 Реальная торговля:\n"
             "/addcoin /removecoin /setreallot /setbalancebuffer\n"
@@ -1121,21 +1079,17 @@ async def polling_loop(session):
 async def scan_loop(session):
     await asyncio.sleep(15)
     while True:
-        if trading_paused:
-            await asyncio.sleep(config["scan_interval"])
-            continue
         try:
             opps, active = await scan_cycle(session)
             logger.info(f"Scan #{stats['scans']}: {len(active)} бирж, {len(opps)} сигналов")
             for opp in opps[:5]:
-                if trading_paused:  # могло смениться прямо во время обработки списка сигналов
-                    break
                 key = f"{opp['symbol']}-{opp['quote']}-{opp['buy_ex']}-{opp['sell_ex']}"
                 now = datetime.now().timestamp()
                 if now - last_signal_time.get(key, 0) > 120:
                     last_signal_time[key] = now
                     if CHAT_ID:
                         await send_tg(session, format_signal(opp))
+                        await asyncio.sleep(0.7)  # не спамить Telegram — иначе он начинает душить чат
                     await execute_sim(opp, session)
         except Exception as e:
             stats["errors"] += 1
@@ -1148,7 +1102,7 @@ async def scan_loop(session):
 # ══════════════════════════════════════════════════════════════════════════
 # Отдельный слой поверх скринера выше — не трогает ни одну из старых функций
 # (/leaderboard, /pairs, /routes, /balances, /top, /prices, /exchanges,
-# мультивалютный арбитраж, /pause, /resume, стоп-лосс симуляции). Здесь —
+# мультивалютный арбитраж, стоп-лосс-уведомления симуляции). Здесь —
 # реальные подписанные ордера, отдельные лимиты, отдельные команды.
 #
 # ⚠️ ЭТОТ КОД НЕ ПРОВЕРЕН НА ЖИВЫХ API — писался по детальной спецификации,
