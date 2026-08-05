@@ -64,13 +64,39 @@ FEES = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# СПИСОК МОНЕТ ДЛЯ СКРИНИНГА — сузили до 6 конкретных ликвидных монет
-# по запросу (было ~130 в широком скрининге). Это топовые по капитализации
-# монеты — у них меньше шансов на спред между Binance/KuCoin/HTX, чем у
-# мелких альтов (крупные монеты плотнее арбитражатся другими ботами), но
-# зато они ликвиднее и предсказуемее для дальнейшей реальной торговли.
+# ШИРОКИЙ СПИСОК МОНЕТ ДЛЯ СКРИНИНГА (снова все — по запросу)
+# Цель — максимальный охват, а не точечный выбор. Часть монет может
+# отсутствовать на одной или нескольких биржах — это нормально, такие
+# просто не попадут в сравнение (см. find_arbitrage: нужно >=2 биржи).
+# Все монеты, которые раньше выбирались отдельно (TRX, DOGE, XRP, ADA,
+# LTC, TON), уже входят в список ниже — категория "Топ / майоры" и "Прочее".
 # ══════════════════════════════════════════════════════════════
-SYMBOLS = ["TRX", "DOGE", "XRP", "ADA", "LTC", "TON"]
+SYMBOLS = [
+    # Топ / майоры
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "TRX", "DOT", "AVAX",
+    "LINK", "NEAR", "ATOM", "LTC", "BCH", "ETC", "BNB",
+    # L2 / новые сети
+    "MATIC", "ARB", "OP", "SUI", "APT", "ZK", "STRK", "MANTA", "SEI",
+    "TIA", "INJ", "WLD", "IMX", "METIS", "BLAST",
+    # DeFi
+    "UNI", "AAVE", "CRV", "COMP", "MKR", "SNX", "YFI", "SUSHI", "CAKE",
+    "DYDX", "LDO", "GMX", "RUNE", "1INCH", "BAL", "ZRX",
+    # AI-токены
+    "FET", "AGIX", "OCEAN", "RENDER", "TAO", "ARKM", "RLC",
+    # Мем-коины
+    "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "BOME", "MEME",
+    # Игры / NFT
+    "SAND", "MANA", "AXS", "GALA", "ENJ", "APE", "ILV", "MAGIC",
+    # Другие L1
+    "VET", "HBAR", "ALGO", "XLM", "EOS", "FTM", "ROSE", "ONE", "KAVA",
+    "CELO", "ZIL", "QTUM", "WAVES", "KSM", "ICP", "KAS", "EGLD", "FLOW",
+    "XTZ", "NEO", "IOTA", "IOST", "ONT", "CKB",
+    # Инфраструктура / индексация / storage
+    "GRT", "ANKR", "SKL", "STORJ", "FIL", "AR",
+    # Прочее
+    "CHZ", "GMT", "RVN", "THETA", "MASK", "GAL", "PYTH", "JUP", "JTO",
+    "TON", "ORDI", "WOO", "PERP", "LRC", "BAT", "COTI",
+]
 QUOTE = "USDT"
 
 # Статистика по каждой монете (агрегат по всем валютам котировки) — для /leaderboard
@@ -525,6 +551,7 @@ async def handle_command(session, text, chat_id):
             f"/scan — скан сейчас\n"
             f"/top — топ пар по спреду (по всем валютам котировки)\n"
             f"/prices SYMBOL — цены по монете на всех биржах и валютах котировки\n"
+            f"/depthcheck SYMBOL — реальная глубина стакана и проскальзывание на 1x/5x/10x лота\n"
             f"/exchanges — диагностика бирж\n"
             f"/leaderboard — рейтинг монет (агрегат по всем валютам)\n"
             f"/pairs — рейтинг конкретных связок монета/валюта\n"
@@ -628,42 +655,118 @@ async def handle_command(session, text, chat_id):
             msg += "\n"
         await send_tg(session, msg)
 
+    elif cmd == "/depthcheck":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/depthcheck TRX`\nПоказывает реальную глубину стакана (не только top-of-book) — сколько объёма выдержит рынок, прежде чем цена сдвинется.")
+            return
+        sym = parts[1].upper()
+        if sym not in SYMBOLS:
+            await send_tg(session, f"❌ `{sym}` нет в списке скрининга.")
+            return
+        await send_tg(session, f"🔍 Смотрю реальную глубину стакана {sym}/USDT на всех биржах...")
+
+        lot = config["lot_usdt"]
+        msg = f"📏 *ГЛУБИНА СТАКАНА — {sym}/USDT*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        any_data = False
+
+        for ex in ("Binance", "KuCoin", "HTX"):
+            symbol_fmt = SYMBOL_FMT[ex](sym)
+            try:
+                book = await ORDERBOOK_FN[ex](session, symbol_fmt)
+            except Exception as e:
+                book = None
+                logger.error(f"depthcheck {ex} {sym}: {e}")
+
+            if not book or not book.get("bids") or not book.get("asks"):
+                msg += f"⚠️ *{ex}*: нет данных стакана\n\n"
+                continue
+            any_data = True
+
+            best_bid = book["bids"][0][0]
+            best_ask = book["asks"][0][0]
+            total_bid_notional = sum(p * q for p, q in book["bids"])
+            total_ask_notional = sum(p * q for p, q in book["asks"])
+
+            msg += (
+                f"*{ex}*\n"
+                f"  Лучший bid/ask: `{best_bid}` / `{best_ask}`\n"
+                f"  Уровней в стакане: {len(book['bids'])} bid / {len(book['asks'])} ask\n"
+                f"  Ликвидность на покупку (все ask): `${round(total_ask_notional,2)}`\n"
+                f"  Ликвидность на продажу (все bid): `${round(total_bid_notional,2)}`\n"
+            )
+
+            for mult, label in [(1, "1x лот"), (5, "5x лот"), (10, "10x лот")]:
+                target = lot * mult
+                qty, avg_price, filled, full = _walk_by_notional(book["asks"], target)
+                if avg_price > 0 and best_ask > 0:
+                    slip = (avg_price - best_ask) / best_ask * 100
+                    warn = " ⚠️ не хватило глубины стакана" if not full else ""
+                    msg += f"  Покупка {label} (~${target:.0f}): ср. цена `{avg_price:.8f}`, проскальзывание `{round(slip,3)}%`{warn}\n"
+            msg += "\n"
+
+        if not any_data:
+            msg += "Ни с одной биржи не удалось получить стакан — проверь /exchanges."
+        msg += "\n_Проскальзывание — насколько твоя средняя цена хуже, чем показывает верхний уровень стакана, если купить лот целиком одним рыночным ордером._"
+        await send_tg(session, msg)
+
     elif cmd == "/report":
-        await send_tg(session, f"📊 Собираю сводный отчёт по {len(SYMBOLS)} монетам...")
+        await send_tg(session, f"📊 Собираю сводный отчёт по {len(SYMBOLS)} монетам (может занять немного времени)...")
         all_data, active = await fetch_all(session)
         saved_threshold = config["min_profit_pct"]
         config["min_profit_pct"] = -999
         all_opps = find_arbitrage(all_data)
         config["min_profit_pct"] = saved_threshold
 
-        msg = f"📈 *ОТЧЁТ ПО МОНЕТАМ — {datetime.now().strftime('%H:%M:%S')}*\n"
-        msg += f"Бирж активно: {len(active)} ({', '.join(active)})\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        header = (
+            f"📈 *ОТЧЁТ ПО МОНЕТАМ — {datetime.now().strftime('%H:%M:%S')}*\n"
+            f"Бирж активно: {len(active)} ({', '.join(active)}) | Монет: {len(SYMBOLS)}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
 
+        blocks = []
         for coin in SYMBOLS:
-            msg += f"💱 *{coin}*\n"
+            block = f"💱 *{coin}*\n"
             usdt_data = all_data.get((coin, "USDT"), {})
             if usdt_data:
                 prices = " | ".join(f"{ex}: `{d['bid']}`/`{d['ask']}`" for ex, d in usdt_data.items())
-                msg += f"   Цены (bid/ask): {prices}\n"
+                block += f"   Цены (bid/ask): {prices}\n"
             else:
-                msg += f"   ⚠️ Нет данных USDT ни с одной биржи прямо сейчас\n"
+                block += "   ⚠️ Нет данных USDT ни с одной биржи прямо сейчас\n"
 
             coin_opps = [o for o in all_opps if o["symbol"] == coin]
             if coin_opps:
                 best = coin_opps[0]
                 icon = "🟢" if best["net_pct"] >= saved_threshold else "🔴"
-                msg += (f"   {icon} Лучший спред сейчас: {best['buy_ex']}→{best['sell_ex']} "
-                        f"через {best['quote']}, чистая маржа `{best['net_pct']}%`\n")
+                block += (f"   {icon} Лучший спред сейчас: {best['buy_ex']}→{best['sell_ex']} "
+                          f"через {best['quote']}, чистая маржа `{best['net_pct']}%`\n")
             else:
-                msg += "   Спреда сейчас не найдено ни по одной паре котировки\n"
+                block += "   Спреда сейчас не найдено ни по одной паре котировки\n"
 
             cs = coin_stats.get(coin, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
-            msg += (f"   За сессию: сигналов `{cs['signals']}`, сделок `{cs['trades']}`, "
-                    f"P&L `{round(cs['profit_usdt'],4)} USDT`, лучшая маржа `{cs['best_net_pct']}%`\n\n")
+            block += (f"   За сессию: сигналов `{cs['signals']}`, сделок `{cs['trades']}`, "
+                      f"P&L `{round(cs['profit_usdt'],4)} USDT`, лучшая маржа `{cs['best_net_pct']}%`\n\n")
+            blocks.append(block)
 
-        msg += f"_Порог сигнала: {saved_threshold}% | Полная детализация — /pairs, /routes_"
-        await send_tg(session, msg)
+        # Разбиваем на сообщения по ~3500 символов (запас от лимита Telegram
+        # в 4096), чтобы отчёт по широкому списку монет не падал целиком
+        # из-за превышения длины — каждая часть уходит отдельным сообщением.
+        MAX_CHUNK = 3500
+        chunks = []
+        current = header
+        for block in blocks:
+            if len(current) + len(block) > MAX_CHUNK:
+                chunks.append(current)
+                current = ""
+            current += block
+        if current.strip():
+            chunks.append(current)
+
+        total = len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            suffix = f"\n_Часть {i}/{total}_" if total > 1 else ""
+            await send_tg(session, chunk + suffix)
+
+        await send_tg(session, f"_Порог сигнала: {saved_threshold}% | Полная детализация — /pairs, /routes_")
 
     elif cmd == "/leaderboard":
         ranked = sorted(coin_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
@@ -984,7 +1087,7 @@ async def handle_command(session, text, chat_id):
 
     else:
         await send_tg(session,
-            "/start /report /scan /top /prices SYMBOL /exchanges\n"
+            "/start /report /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
             "/leaderboard /pairs /routes /balances\n"
             "/stats /history /pause /resume\n"
             "/setprofit 0.15 /setlot 100\n\n"
