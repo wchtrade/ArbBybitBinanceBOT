@@ -674,7 +674,18 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Найдено {len(opps)} сигналов! Топ-3:")
             for opp in opps[:3]:
                 await send_tg(session, format_signal(opp))
-                await execute_sim(opp, session)
+                # ИСПРАВЛЕНИЕ 05.08: раньше симуляция сделки запускалась ДАЖЕ
+                # для сигналов с подозрительным спредом (>=SUSPICIOUS_SPREAD_PCT)
+                # — из-за этого /leaderboard оказался забит фантомной "прибылью"
+                # по ZIL/COTI (те самые монеты, что /verify уже разоблачил как
+                # рассинхрон данных), а реальные, спокойные кандидаты вроде
+                # SUSHI/IOST тонули внизу списка. Подозрительные сигналы
+                # по-прежнему показываются (с предупреждением в тексте), но
+                # больше не считаются "сделкой" и не портят статистику монеты.
+                if opp["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
+                    await execute_sim(opp, session)
+                else:
+                    stats["signals_suspicious_skipped"] = stats.get("signals_suspicious_skipped", 0) + 1
 
     elif cmd == "/exchanges":
         await send_tg(session, "🔍 Проверяю каждую биржу отдельно...")
@@ -918,7 +929,9 @@ async def handle_command(session, text, chat_id):
             f"💰 P&L с последнего уведомления о стоп-лоссе: {round(stats['profit_since_alert'], 4)} USDT\n"
             f"⏳ Ожидает конвертации: {pending_line}\n"
             f"🔄 Конвертаций всего: {len(conversions_log)}\n"
-            f"❌ Ошибок: {stats['errors']}\n\n"
+            f"❌ Ошибок: {stats['errors']}\n"
+            f"🚫 Пропущено как неправдоподобные (не засчитаны в статистику монет): "
+            f"{stats.get('signals_suspicious_skipped', 0)}\n\n"
             f"⏱ Сделок этой минуты: {stats['trades_this_minute']}/{config['max_trades_per_min']}\n\n"
             f"⚙️ Стартовый капитал (справочно): {config['start_capital']} USDT\n"
             f"⚙️ Лот: {config['lot_usdt']} USDT-эквивалент\n"
@@ -1011,7 +1024,10 @@ async def scan_loop(session):
                     if CHAT_ID:
                         await send_tg(session, format_signal(opp))
                         await asyncio.sleep(0.7)
-                    await execute_sim(opp, session)
+                    if opp["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
+                        await execute_sim(opp, session)
+                    else:
+                        stats["signals_suspicious_skipped"] = stats.get("signals_suspicious_skipped", 0) + 1
         except Exception as e:
             stats["errors"] += 1
             logger.error(f"Scan error: {e}")
