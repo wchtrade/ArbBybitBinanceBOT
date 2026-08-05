@@ -59,10 +59,10 @@ QUOTE_CURRENCIES = ["USDT", "BTC", "ETH"]
 
 # Bybit не используется — подтверждённо блокирует облачные IP
 # (Railway/AWS/GCP) через CloudFront (403), без VPS/прокси не лечится.
+# HTX убрана по запросу — остались Binance и KuCoin.
 FEES = {
     "Binance": 0.10,
     "KuCoin":  0.10,
-    "HTX":     0.20,
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -180,7 +180,7 @@ def check_trade_limit() -> bool:
 
 
 # ═══════════════════════════════════════
-# БИРЖИ: Binance, KuCoin, HTX
+# БИРЖИ: Binance, KuCoin (HTX убрана по запросу)
 # Возвращают Dict[(base, quote), {"bid":.., "ask":..}] — теперь не только
 # .../USDT, но и .../BTC, .../ETH (см. QUOTE_CURRENCIES)
 # ═══════════════════════════════════════
@@ -230,30 +230,6 @@ async def get_kucoin(session) -> Dict:
             return out
     except Exception as e:
         logger.error(f"KuCoin: {e}")
-        return {}
-
-
-async def get_htx(session) -> Dict:
-    try:
-        async with session.get(
-            "https://api.huobi.pro/market/tickers",
-            timeout=aiohttp.ClientTimeout(total=8)) as r:
-            out = {}
-            quotes_lower = [(q, q.lower()) for q in _QUOTES_SORTED]
-            for item in (await r.json()).get("data", []):
-                sym = item.get("symbol", "")
-                for q, q_lower in quotes_lower:
-                    if sym.endswith(q_lower):
-                        base = sym[:-len(q_lower)].upper()
-                        if base in SYMBOLS and base != q:
-                            bid = float(item.get("bid", 0) or 0)
-                            ask = float(item.get("ask", 0) or 0)
-                            if bid > 0 and ask > 0:
-                                out[(base, q)] = {"bid": bid, "ask": ask}
-                        break
-            return out
-    except Exception as e:
-        logger.error(f"HTX: {e}")
         return {}
 
 
@@ -378,10 +354,10 @@ def format_signal(opp: dict) -> str:
 
 async def fetch_all(session):
     results = await asyncio.gather(
-        get_binance(session), get_kucoin(session), get_htx(session),
+        get_binance(session), get_kucoin(session),
         return_exceptions=True
     )
-    ex_names = ["Binance", "KuCoin", "HTX"]
+    ex_names = ["Binance", "KuCoin"]
     all_data: Dict[tuple, Dict] = {}
     active = []
     counts = {}
@@ -530,7 +506,7 @@ async def handle_command(session, text, chat_id):
             f"✅ *ArbScreenerBot запущен!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Назначение: мониторинг арбитражных возможностей по {len(SYMBOLS)} монетам: {', '.join(SYMBOLS)}\n"
-            f"Площадки: Binance, KuCoin, HTX\n"
+            f"Площадки: Binance, KuCoin\n"
             f"Валюты котировки: {', '.join(QUOTE_CURRENCIES)} (не только USDT — ещё COIN/BTC и COIN/ETH)\n"
             f"Режим: работает НЕПРЕРЫВНО — без пауз, стоп-лосс только уведомляет\n\n"
             f"⚙️ Стартовый капитал (справочно): `{config['start_capital']} USDT`\n"
@@ -574,10 +550,10 @@ async def handle_command(session, text, chat_id):
     elif cmd == "/exchanges":
         await send_tg(session, "🔍 Проверяю каждую биржу отдельно...")
         results = await asyncio.gather(
-            get_binance(session), get_kucoin(session), get_htx(session),
+            get_binance(session), get_kucoin(session),
             return_exceptions=True
         )
-        ex_names = ["Binance", "KuCoin", "HTX"]
+        ex_names = ["Binance", "KuCoin"]
         msg = "📡 *ДИАГНОСТИКА БИРЖ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for name, r in zip(ex_names, results):
             if isinstance(r, Exception):
@@ -634,7 +610,7 @@ async def handle_command(session, text, chat_id):
                 continue
             ex_data = all_data.get((sym, quote), {})
             msg += f"*{sym}/{quote}:*\n"
-            for ex in ("Binance", "KuCoin", "HTX"):
+            for ex in ("Binance", "KuCoin"):
                 if ex in ex_data:
                     d = ex_data[ex]
                     msg += f"  {ex}: bid `{d['bid']}` / ask `{d['ask']}`\n"
@@ -657,7 +633,7 @@ async def handle_command(session, text, chat_id):
         msg = f"📏 *ГЛУБИНА СТАКАНА — {sym}/USDT*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         any_data = False
 
-        for ex in ("Binance", "KuCoin", "HTX"):
+        for ex in ("Binance", "KuCoin"):
             symbol_fmt = SYMBOL_FMT[ex](sym)
             try:
                 book = await ORDERBOOK_FN[ex](session, symbol_fmt)
@@ -841,7 +817,7 @@ async def handle_command(session, text, chat_id):
             f"⚙️ Порог автоконвертации: {config['convert_threshold_usdt']} USDT\n"
             f"⚙️ Монет в скрининге: {len(SYMBOLS)}\n"
             f"⚙️ Валюты котировки: {', '.join(QUOTE_CURRENCIES)}\n"
-            f"⚙️ Бирж: 3 (Binance/KuCoin/HTX)\n\n"
+            f"⚙️ Бирж: 2 (Binance/KuCoin)\n\n"
             f"/leaderboard — какие монеты реально сработали | /pairs — через какую валюту | /balances — детали накоплений"
         )
 
@@ -1105,7 +1081,7 @@ async def scan_loop(session):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# WorkerArbBot — РЕАЛЬНАЯ АРБИТРАЖНАЯ ТОРГОВЛЯ (Binance/KuCoin/HTX)
+# WorkerArbBot — РЕАЛЬНАЯ АРБИТРАЖНАЯ ТОРГОВЛЯ (Binance/KuCoin)
 # ══════════════════════════════════════════════════════════════════════════
 # Отдельный слой поверх скринера выше — не трогает ни одну из старых функций
 # (/leaderboard, /pairs, /routes, /balances, /top, /prices, /exchanges,
@@ -1117,15 +1093,22 @@ async def scan_loop(session):
 # собирал. Прежде чем включать реальные деньги: (1) прогони в SIMULATION
 # минимум несколько дней, (2) включай REAL с минимальным /setreallot
 # (10-15 USDT) и проверь на паре сделок, что подпись запросов и парсинг
-# ответов бирж работают как ожидается — особенно KuCoin (пасфраза) и HTX
-# (account-id, специфичная схема подписи).
+# ответов бирж работают как ожидается — особенно KuCoin (пасфраза шифруется
+# отдельно от обычной подписи).
 
 # ── РОЛИ БИРЖ И АКТИВНЫЕ МАРШРУТЫ ──────────────────────────────────────────
-# Binance и KuCoin — только ПОКУПАЮТ. HTX — только ПРОДАЁТ.
-# Пара HTX→KuCoin намеренно отключена: при небольшом капитале HTX не может
-# одновременно держать резерв USDT под покупку И резерв монеты под продажу —
-# регулярно приводило к отказам "insufficient balance".
-PAIRS: List[Tuple[str, str]] = [("KuCoin", "HTX"), ("Binance", "HTX")]
+# HTX убрана по запросу. ВАЖНАЯ ОГОВОРКА: раньше HTX была выделена как
+# биржа только-на-продажу именно чтобы ни одна биржа не держала резерв
+# USDT под покупку И резерв монеты под продажу одновременно — это была
+# главная причина отказов "insufficient balance" в истории бота. С двумя
+# биржами эта проблема возвращается: и Binance, и KuCoin теперь играют
+# ОБЕ роли (каждая то покупает, то продаёт, в зависимости от направления
+# сигнала) — значит на каждой из них нужно держать резерв и в USDT, и в
+# монете одновременно. Если снова начнёшь ловить "insufficient balance" —
+# это ожидаемо при таком раскладе, а не баг; тогда либо увеличивай
+# /setrebalance и /setheadroom с запасом на обе стороны сразу, либо
+# возвращай третью биржу под роль "только продажа".
+PAIRS: List[Tuple[str, str]] = [("Binance", "KuCoin"), ("KuCoin", "Binance")]
 
 
 def get_buy_exchanges() -> List[str]:
@@ -1194,7 +1177,6 @@ def real_trading_ready() -> bool:
     keys_present = all([
         BINANCE_API_KEY, BINANCE_API_SECRET,
         KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE,
-        HTX_ACCESS_KEY, HTX_SECRET_KEY,
     ])
     return REAL_TRADING_UNLOCKED_ENV and _confirm_real_runtime and keys_present
 
@@ -1205,7 +1187,6 @@ def real_trading_status_text() -> str:
         ("Подтверждение /confirmreal в этой сессии", _confirm_real_runtime),
         ("Binance ключи", bool(BINANCE_API_KEY and BINANCE_API_SECRET)),
         ("KuCoin ключи (+ passphrase)", bool(KUCOIN_API_KEY and KUCOIN_API_SECRET and KUCOIN_API_PASSPHRASE)),
-        ("HTX ключи", bool(HTX_ACCESS_KEY and HTX_SECRET_KEY)),
     ]
     return "\n".join(f"{'✅' if ok else '❌'} {label}" for label, ok in checks)
 
@@ -1559,10 +1540,10 @@ def sym_kucoin(base: str) -> str: return f"{base}-USDT"
 def sym_htx(base: str) -> str: return f"{base.lower()}usdt"
 
 
-SYMBOL_FMT   = {"Binance": sym_binance, "KuCoin": sym_kucoin, "HTX": sym_htx}
-ORDERBOOK_FN = {"Binance": get_orderbook_binance, "KuCoin": get_orderbook_kucoin, "HTX": get_orderbook_htx}
-BALANCE_FN   = {"Binance": binance_get_balance, "KuCoin": kucoin_get_balance, "HTX": htx_get_balance}
-FILTERS_FN   = {"Binance": binance_get_filters, "KuCoin": kucoin_get_filters, "HTX": htx_get_filters}
+SYMBOL_FMT   = {"Binance": sym_binance, "KuCoin": sym_kucoin}
+ORDERBOOK_FN = {"Binance": get_orderbook_binance, "KuCoin": get_orderbook_kucoin}
+BALANCE_FN   = {"Binance": binance_get_balance, "KuCoin": kucoin_get_balance}
+FILTERS_FN   = {"Binance": binance_get_filters, "KuCoin": kucoin_get_filters}
 
 
 async def real_market_buy(session, exchange: str, base: str, quote_qty: float):
@@ -1736,8 +1717,7 @@ def check_real_trade_limits() -> Optional[str]:
 async def top_up_coin_reserve(session, exchange: str, base: str, needed_extra_qty: float,
                                ref_price: float) -> bool:
     """Докупает недостающее количество монеты прямо на бирже, где не хватает
-    резерва под продажу (обычно HTX) — рыночной покупкой на этой же бирже,
-    с запасом на буфер."""
+    резерва под продажу — рыночной покупкой на этой же бирже, с запасом на буфер."""
     buffer_mult = 1 + real_config["balance_safety_buffer_pct"] / 100
     quote_needed = needed_extra_qty * ref_price * buffer_mult
     filters = await get_real_filters(session, exchange, base)
@@ -2037,7 +2017,7 @@ async def main():
         logger.error("ARB_BOT_TOKEN не установлен!")
         return
     logger.info(
-        f"ArbScreenerBot | {len(SYMBOLS)} монет (скрининг) | 3 биржи (Binance/KuCoin/HTX) | "
+        f"ArbScreenerBot | {len(SYMBOLS)} монет (скрининг) | 2 биржи (Binance/KuCoin) | "
         f"лот {config['lot_usdt']} USDT | стоп-лосс -{config['stop_loss_usdt']} USDT | "
         f"порог {config['min_profit_pct']}%"
     )
