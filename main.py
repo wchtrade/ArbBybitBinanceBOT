@@ -37,6 +37,12 @@ config = {
     "simulation_mode": True,   # бот только симулирует, реальных ордеров нет — см. шапку файла
     "max_trades_per_min": int(os.environ.get("MAX_TRADES_PER_MIN", "5")),
     "convert_threshold_usdt": float(os.environ.get("CONVERT_THRESHOLD_USDT", "20")),
+    # По умолчанию ВЫКЛЮЧЕНО — бот работает непрерывно, без автопауз по
+    # стоп-лоссу симуляции. Стоп-лосс продолжает считаться и сообщается в
+    # /stats и уведомлением при достижении, но сканирование не останавливает.
+    # Ручная /pause /resume по-прежнему доступны, если захочешь остановить
+    # сам. Включить автопаузу обратно — ARB_AUTO_PAUSE=YES.
+    "auto_pause_on_stop_loss": os.environ.get("ARB_AUTO_PAUSE", "").upper() == "YES",
 }
 
 # Стоп-лосс: при накопленном P&L <= -stop_loss_usdt торговля (запись в
@@ -58,37 +64,13 @@ FEES = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# ШИРОКИЙ СПИСОК МОНЕТ ДЛЯ СКРИНИНГА (~130 шт)
-# Цель — максимальный охват, а не точечный выбор. Часть монет может
-# отсутствовать на одной или нескольких биржах — это нормально, такие
-# просто не попадут в сравнение (см. find_arbitrage: нужно >=2 биржи).
+# СПИСОК МОНЕТ ДЛЯ СКРИНИНГА — сузили до 6 конкретных ликвидных монет
+# по запросу (было ~130 в широком скрининге). Это топовые по капитализации
+# монеты — у них меньше шансов на спред между Binance/KuCoin/HTX, чем у
+# мелких альтов (крупные монеты плотнее арбитражатся другими ботами), но
+# зато они ликвиднее и предсказуемее для дальнейшей реальной торговли.
 # ══════════════════════════════════════════════════════════════
-SYMBOLS = [
-    # Топ / майоры
-    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "TRX", "DOT", "AVAX",
-    "LINK", "NEAR", "ATOM", "LTC", "BCH", "ETC", "BNB",
-    # L2 / новые сети
-    "MATIC", "ARB", "OP", "SUI", "APT", "ZK", "STRK", "MANTA", "SEI",
-    "TIA", "INJ", "WLD", "IMX", "METIS", "BLAST",
-    # DeFi
-    "UNI", "AAVE", "CRV", "COMP", "MKR", "SNX", "YFI", "SUSHI", "CAKE",
-    "DYDX", "LDO", "GMX", "RUNE", "1INCH", "BAL", "ZRX",
-    # AI-токены
-    "FET", "AGIX", "OCEAN", "RENDER", "TAO", "ARKM", "RLC",
-    # Мем-коины
-    "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "BOME", "MEME",
-    # Игры / NFT
-    "SAND", "MANA", "AXS", "GALA", "ENJ", "APE", "ILV", "MAGIC",
-    # Другие L1
-    "VET", "HBAR", "ALGO", "XLM", "EOS", "FTM", "ROSE", "ONE", "KAVA",
-    "CELO", "ZIL", "QTUM", "WAVES", "KSM", "ICP", "KAS", "EGLD", "FLOW",
-    "XTZ", "NEO", "IOTA", "IOST", "ONT", "CKB",
-    # Инфраструктура / индексация / storage
-    "GRT", "ANKR", "SKL", "STORJ", "FIL", "AR",
-    # Прочее
-    "CHZ", "GMT", "RVN", "THETA", "MASK", "GAL", "PYTH", "JUP", "JTO",
-    "TON", "ORDI", "WOO", "PERP", "LRC", "BAT", "COTI",
-]
+SYMBOLS = ["TRX", "DOGE", "XRP", "ADA", "LTC", "TON"]
 QUOTE = "USDT"
 
 # Статистика по каждой монете (агрегат по всем валютам котировки) — для /leaderboard
@@ -486,17 +468,32 @@ async def execute_sim(opp: dict, session=None):
     )
 
     if stats["profit_since_resume"] <= -config["stop_loss_usdt"]:
-        trading_paused = True
-        pause_reason = f"стоп-лосс {config['stop_loss_usdt']} USDT достигнут (P&L с последнего запуска: {round(stats['profit_since_resume'], 2)})"
-        logger.warning(f"СТОП-ЛОСС СРАБОТАЛ: {pause_reason}")
-        if session is not None:
-            await send_tg(session,
-                f"🛑 *СТОП-ЛОСС СРАБОТАЛ*\n"
-                f"P&L с последнего включения: `{round(stats['profit_since_resume'], 2)} USDT` (лимит: -{config['stop_loss_usdt']} USDT)\n"
-                f"Общий P&L за всё время: `{round(stats['profit_sim'], 2)} USDT`\n\n"
-                f"Сканирование остановлено полностью, новых сигналов не будет.\n"
-                f"Включить обратно — команда `/resume`."
-            )
+        pnl_line = (
+            f"P&L с последнего включения: `{round(stats['profit_since_resume'], 2)} USDT` (лимит: -{config['stop_loss_usdt']} USDT)\n"
+            f"Общий P&L за всё время: `{round(stats['profit_sim'], 2)} USDT`\n\n"
+        )
+        if config["auto_pause_on_stop_loss"]:
+            trading_paused = True
+            pause_reason = f"стоп-лосс {config['stop_loss_usdt']} USDT достигнут (P&L с последнего запуска: {round(stats['profit_since_resume'], 2)})"
+            logger.warning(f"СТОП-ЛОСС СРАБОТАЛ: {pause_reason}")
+            if session is not None:
+                await send_tg(session,
+                    f"🛑 *СТОП-ЛОСС СРАБОТАЛ*\n{pnl_line}"
+                    f"Сканирование остановлено полностью, новых сигналов не будет.\n"
+                    f"Включить обратно — команда `/resume`."
+                )
+        else:
+            # Бот настроен работать непрерывно (по умолчанию) — только
+            # уведомляем и сбрасываем счётчик "с последнего включения",
+            # чтобы не спамить одним и тем же уведомлением каждую сделку.
+            logger.warning(f"Стоп-лосс достигнут (P&L с последнего сброса: {round(stats['profit_since_resume'], 2)}), но авто-пауза выключена — продолжаю сканировать")
+            if session is not None:
+                await send_tg(session,
+                    f"⚠️ *Стоп-лосс достигнут* (но авто-пауза выключена — работаю дальше)\n{pnl_line}"
+                    f"Хочешь, чтобы бот останавливался автоматически — задай ARB_AUTO_PAUSE=YES.\n"
+                    f"Остановить вручную прямо сейчас — команда `/pause`."
+                )
+            stats["profit_since_resume"] = 0.0
 
 
 # ═══════════════════════════════════════
@@ -514,28 +511,29 @@ async def handle_command(session, text, chat_id):
         await send_tg(session,
             f"✅ *ArbScreenerBot запущен!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Назначение: СКРИНИНГ — искать новые монеты для будущей реальной торговли.\n"
+            f"Назначение: мониторинг арбитражных возможностей по {len(SYMBOLS)} монетам: {', '.join(SYMBOLS)}\n"
             f"Площадки: Binance, KuCoin, HTX\n"
-            f"Монет в скрининге: {len(SYMBOLS)}\n"
-            f"Валюты котировки: {', '.join(QUOTE_CURRENCIES)} (не только USDT — ещё COIN/BTC и COIN/ETH)\n\n"
+            f"Валюты котировки: {', '.join(QUOTE_CURRENCIES)} (не только USDT — ещё COIN/BTC и COIN/ETH)\n"
+            f"Режим: {'работает НЕПРЕРЫВНО — автопауза по стоп-лоссу выключена, только уведомление' if not config['auto_pause_on_stop_loss'] else 'автопауза по стоп-лоссу включена (ARB_AUTO_PAUSE=YES)'}\n\n"
             f"⚙️ Стартовый капитал (справочно): `{config['start_capital']} USDT`\n"
             f"⚙️ Лот/шаг сделки: `{config['lot_usdt']} USDT`-эквивалент\n"
-            f"⚙️ Стоп-лосс: `-{config['stop_loss_usdt']} USDT` (только `/resume` включает обратно)\n"
+            f"⚙️ Стоп-лосс (уведомление): `-{config['stop_loss_usdt']} USDT`\n"
             f"⚙️ Порог маржи: `{config['min_profit_pct']}%`\n"
             f"⚙️ Порог автоконвертации BTC/ETH→USDT: `{config['convert_threshold_usdt']} USDT`\n"
             f"⚙️ Лимит: `{config['max_trades_per_min']} сделок/мин`\n\n"
+            f"/report — сводный отчёт: цены, спред, статистика по каждой монете\n"
             f"/scan — скан сейчас\n"
             f"/top — топ пар по спреду (по всем валютам котировки)\n"
             f"/prices SYMBOL — цены по монете на всех биржах и валютах котировки\n"
             f"/exchanges — диагностика бирж\n"
-            f"/leaderboard — рейтинг монет-кандидатов на реал (агрегат по всем валютам)\n"
+            f"/leaderboard — рейтинг монет (агрегат по всем валютам)\n"
             f"/pairs — рейтинг конкретных связок монета/валюта\n"
             f"/routes — рейтинг маршрутов биржа→биржа (где арбитраж чаще всего)\n"
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика\n"
             f"/history — последние сделки\n"
-            f"/pause — приостановить торговлю вручную\n"
-            f"/resume — снять паузу (ручную или после стоп-лосса)\n"
+            f"/pause — приостановить вручную (бот сам не останавливается)\n"
+            f"/resume — снять паузу\n"
             f"/setprofit 0.15 — порог маржи\n"
             f"/setlot 100 — изменить размер лота\n"
         )
@@ -630,6 +628,43 @@ async def handle_command(session, text, chat_id):
             msg += "\n"
         await send_tg(session, msg)
 
+    elif cmd == "/report":
+        await send_tg(session, f"📊 Собираю сводный отчёт по {len(SYMBOLS)} монетам...")
+        all_data, active = await fetch_all(session)
+        saved_threshold = config["min_profit_pct"]
+        config["min_profit_pct"] = -999
+        all_opps = find_arbitrage(all_data)
+        config["min_profit_pct"] = saved_threshold
+
+        msg = f"📈 *ОТЧЁТ ПО МОНЕТАМ — {datetime.now().strftime('%H:%M:%S')}*\n"
+        msg += f"Бирж активно: {len(active)} ({', '.join(active)})\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        for coin in SYMBOLS:
+            msg += f"💱 *{coin}*\n"
+            usdt_data = all_data.get((coin, "USDT"), {})
+            if usdt_data:
+                prices = " | ".join(f"{ex}: `{d['bid']}`/`{d['ask']}`" for ex, d in usdt_data.items())
+                msg += f"   Цены (bid/ask): {prices}\n"
+            else:
+                msg += f"   ⚠️ Нет данных USDT ни с одной биржи прямо сейчас\n"
+
+            coin_opps = [o for o in all_opps if o["symbol"] == coin]
+            if coin_opps:
+                best = coin_opps[0]
+                icon = "🟢" if best["net_pct"] >= saved_threshold else "🔴"
+                msg += (f"   {icon} Лучший спред сейчас: {best['buy_ex']}→{best['sell_ex']} "
+                        f"через {best['quote']}, чистая маржа `{best['net_pct']}%`\n")
+            else:
+                msg += "   Спреда сейчас не найдено ни по одной паре котировки\n"
+
+            cs = coin_stats.get(coin, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+            msg += (f"   За сессию: сигналов `{cs['signals']}`, сделок `{cs['trades']}`, "
+                    f"P&L `{round(cs['profit_usdt'],4)} USDT`, лучшая маржа `{cs['best_net_pct']}%`\n\n")
+
+        msg += f"_Порог сигнала: {saved_threshold}% | Полная детализация — /pairs, /routes_"
+        await send_tg(session, msg)
+
     elif cmd == "/leaderboard":
         ranked = sorted(coin_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
         ranked = [r for r in ranked if r[1]["signals"] > 0][:20]
@@ -702,6 +737,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session,
             f"📈 *СТАТИСТИКА*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⏸ Пауза: {('*ДА* — ' + pause_reason) if trading_paused else 'нет'}\n"
+            f"🔁 Автопауза по стоп-лоссу: {'включена' if config['auto_pause_on_stop_loss'] else 'выключена — бот работает непрерывно'}\n"
             f"Аптайм: {h}ч {m}м\n\n"
             f"🔍 Сканов: {stats['scans']}\n"
             f"🎯 Сигналов: {stats['signals']}\n"
@@ -948,7 +984,7 @@ async def handle_command(session, text, chat_id):
 
     else:
         await send_tg(session,
-            "/start /scan /top /prices SYMBOL /exchanges\n"
+            "/start /report /scan /top /prices SYMBOL /exchanges\n"
             "/leaderboard /pairs /routes /balances\n"
             "/stats /history /pause /resume\n"
             "/setprofit 0.15 /setlot 100\n\n"
