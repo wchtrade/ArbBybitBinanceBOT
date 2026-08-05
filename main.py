@@ -622,7 +622,16 @@ async def handle_command(session, text, chat_id):
                 "Пример: `/verify TRX DOGE XRP ADA LTC TON` (до 8 монет)"
             )
             return
-        candidates = [p.upper() for p in parts[1:9]]
+        # ИСПРАВЛЕНИЕ: раньше "/verify ZIL, COTI, YFI" (с запятыми, как
+        # люди обычно и пишут через запятую) ломался — "ZIL," с запятой
+        # воспринималось как отдельный, несуществующий тикер, и биржи
+        # честно отвечали "нет данных". Теперь запятые/точки с запятой
+        # убираются, пустые токены после этого пропускаются.
+        raw_candidates = " ".join(parts[1:]).replace(",", " ").replace(";", " ").split()
+        candidates = [p.upper() for p in raw_candidates if p][:8]
+        if not candidates:
+            await send_tg(session, "Не нашёл ни одной монеты в команде. Пример: `/verify TRX DOGE XRP`")
+            return
         await send_tg(session, f"🔍 Проверяю глубину и согласованность цены для: {', '.join(candidates)}...")
 
         results = []
