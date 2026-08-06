@@ -277,6 +277,75 @@ def _walk_by_notional(levels: List[list], target_notional: float):
     return base_qty, avg_price, filled_notional, remaining <= 1e-9
 
 
+def _walk_by_qty(levels: List[list], target_qty: float):
+    """Продажа: отдаём target_qty базовой монеты, получаем котируемую
+    валюту — обратная сторона _walk_by_notional. Нужна для честного
+    пересчёта ноги ПРОДАЖИ (по bid-стороне стакана)."""
+    remaining = target_qty
+    quote_out = 0.0
+    for price, qty in levels:
+        if price <= 0 or qty <= 0:
+            continue
+        take = min(qty, remaining)
+        quote_out += take * price
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    avg_price = quote_out / (target_qty - remaining) if (target_qty - remaining) > 0 else 0.0
+    return quote_out, avg_price, remaining <= 1e-9
+
+
+async def reverify_with_depth(session, opp: dict) -> Optional[dict]:
+    """ИСПРАВЛЕНИЕ 06.08: раньше find_arbitrage/execute_sim работали ТОЛЬКО
+    по верхней строчке стакана (best ask/best bid) — без проверки реальной
+    глубины. Из-за этого статистика (в т.ч. "42 сделки IOST, $14 прибыли")
+    могла быть завышена относительно того, что дал бы реальный ордер с
+    проскальзыванием — WorkerArbBot считает честно через walk-the-book С
+    САМОГО НАЧАЛА, отсюда и расхождение в количестве "сигналов" между двумя
+    ботами: WorkerArbBot не глючит, монитор был излишне оптимистичен.
+    Теперь перед тем, как засчитать что-либо как сигнал/сделку, для
+    USDT-пар делается честный пересчёт по реальной глубине (как в
+    verify_candidate) — если он не подтверждает исходную оценку, сигнал не
+    принимается. Для BTC/ETH-пар пока пропускаем (редкий случай, отдельная
+    доработка при необходимости)."""
+    if opp["quote"] != "USDT":
+        return opp  # не USDT-пара — честную глубину не считаем, оставляем как есть (редкий случай)
+
+    sym = opp["symbol"]
+    buy_ex, sell_ex = opp["buy_ex"], opp["sell_ex"]
+    if buy_ex not in ORDERBOOK_FN or sell_ex not in ORDERBOOK_FN:
+        return None
+
+    buy_book = await ORDERBOOK_FN[buy_ex](session, SYMBOL_FMT[buy_ex](sym))
+    sell_book = await ORDERBOOK_FN[sell_ex](session, SYMBOL_FMT[sell_ex](sym))
+    if not buy_book or not sell_book:
+        return None
+
+    lot_usdt = opp["volume_usdt"]
+    coins, avg_buy, filled_usdt, buy_full = _walk_by_notional(buy_book["asks"], lot_usdt)
+    if not buy_full or coins <= 0:
+        return None
+    buy_fee = FEES.get(buy_ex, 0.1) / 100
+    coins_after_fee = coins * (1 - buy_fee)
+    quote_out, avg_sell, sell_full = _walk_by_qty(sell_book["bids"], coins_after_fee)
+    if not sell_full or quote_out <= 0:
+        return None
+    sell_fee = FEES.get(sell_ex, 0.1) / 100
+    final_usdt = quote_out * (1 - sell_fee)
+    profit = final_usdt - lot_usdt
+    net_pct = profit / lot_usdt * 100
+
+    if net_pct < config["min_profit_pct"]:
+        return None  # честная, учитывающая проскальзывание цена уже не проходит порог
+
+    reverified = dict(opp)
+    reverified["net_pct"] = round(net_pct, 4)
+    reverified["profit_usdt"] = round(profit, 4)
+    reverified["gross_pct"] = round((avg_sell - avg_buy) / avg_buy * 100, 4) if avg_buy > 0 else opp["gross_pct"]
+    reverified["depth_verified"] = True
+    return reverified
+
+
 async def verify_candidate(session, sym: str, lot_usdt: float) -> dict:
     """ГЛАВНАЯ проверочная функция — общая для /depthcheck и /verify.
     Проверяет РЕАЛЬНУЮ глубину стакана (не top-of-book) на Binance и
@@ -683,7 +752,16 @@ async def handle_command(session, text, chat_id):
                 # по-прежнему показываются (с предупреждением в тексте), но
                 # больше не считаются "сделкой" и не портят статистику монеты.
                 if opp["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
-                    await execute_sim(opp, session)
+                    # ИСПРАВЛЕНИЕ 06.08: наивная top-of-book цена, по которой
+                    # находится сигнал, ещё не значит, что реальный ордер
+                    # с учётом проскальзывания даст ту же маржу — честный
+                    # пересчёт по глубине стакана (как у WorkerArbBot) может
+                    # не подтвердить исходную оценку.
+                    verified = await reverify_with_depth(session, opp)
+                    if verified:
+                        await execute_sim(verified, session)
+                    else:
+                        stats["depth_reverify_failed"] = stats.get("depth_reverify_failed", 0) + 1
                 else:
                     stats["signals_suspicious_skipped"] = stats.get("signals_suspicious_skipped", 0) + 1
 
@@ -931,7 +1009,9 @@ async def handle_command(session, text, chat_id):
             f"🔄 Конвертаций всего: {len(conversions_log)}\n"
             f"❌ Ошибок: {stats['errors']}\n"
             f"🚫 Пропущено как неправдоподобные (не засчитаны в статистику монет): "
-            f"{stats.get('signals_suspicious_skipped', 0)}\n\n"
+            f"{stats.get('signals_suspicious_skipped', 0)}\n"
+            f"🚫 Не подтвердились при честном пересчёте по глубине стакана: "
+            f"{stats.get('depth_reverify_failed', 0)}\n\n"
             f"⏱ Сделок этой минуты: {stats['trades_this_minute']}/{config['max_trades_per_min']}\n\n"
             f"⚙️ Стартовый капитал (справочно): {config['start_capital']} USDT\n"
             f"⚙️ Лот: {config['lot_usdt']} USDT-эквивалент\n"
@@ -1025,7 +1105,11 @@ async def scan_loop(session):
                         await send_tg(session, format_signal(opp))
                         await asyncio.sleep(0.7)
                     if opp["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
-                        await execute_sim(opp, session)
+                        verified = await reverify_with_depth(session, opp)
+                        if verified:
+                            await execute_sim(verified, session)
+                        else:
+                            stats["depth_reverify_failed"] = stats.get("depth_reverify_failed", 0) + 1
                     else:
                         stats["signals_suspicious_skipped"] = stats.get("signals_suspicious_skipped", 0) + 1
         except Exception as e:
