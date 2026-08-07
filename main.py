@@ -97,11 +97,16 @@ SYMBOLS = [
     "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "BOME", "MEME",
     "SAND", "MANA", "AXS", "GALA", "ENJ", "APE", "ILV", "MAGIC",
     "VET", "HBAR", "ALGO", "XLM", "EOS", "FTM", "ROSE", "ONE", "KAVA",
-    "CELO", "ZIL", "QTUM", "WAVES", "KSM", "ICP", "KAS", "EGLD", "FLOW",
+    "CELO", "QTUM", "WAVES", "KSM", "ICP", "KAS", "EGLD", "FLOW",
     "XTZ", "NEO", "IOTA", "IOST", "ONT", "CKB",
     "GRT", "ANKR", "SKL", "STORJ", "FIL", "AR",
     "CHZ", "GMT", "RVN", "THETA", "MASK", "GAL", "PYTH", "JUP", "JTO",
-    "TON", "ORDI", "WOO", "PERP", "LRC", "BAT", "COTI",
+    "TON", "ORDI", "WOO", "PERP", "LRC", "BAT",
+    # ИСКЛЮЧЕНЫ 07.08: ZIL и COTI — многократно подтверждённый шум (реальный
+    # разрыв цены по ZIL из-за миграции токена, аналогичная ситуация по
+    # COTI), не реальные сигналы. Постоянно доминировали в /leaderboard и
+    # /routes, засоряя обзор. Если ситуация с миграцией токенов когда-нибудь
+    # разрешится — можно вернуть их в список вручную.
 ]
 QUOTE = "USDT"
 
