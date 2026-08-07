@@ -62,11 +62,23 @@ QUOTE_CURRENCIES = ["USDT", "BTC", "ETH"]
 
 # Bybit не используется — подтверждённо блокирует облачные IP
 # (Railway/AWS/GCP) через CloudFront (403), без VPS/прокси не лечится.
-# HTX убрана по опыту WorkerArbBot — там же выяснилось, что HTX почти
-# всегда даёт самую тонкую/оторванную от рынка ликвидность из трёх бирж.
+#
+# ДОБАВЛЕНО 07.08: HTX, Gate.io, Bitget, MEXC — по вашему запросу расширяем
+# охват с 2 до 6 бирж. Смысл — увеличить "площадь поиска": Binance/KuCoin
+# оказались слишком эффективны (маркет-мейкеры вычищают почти все
+# расхождения), у MEXC и Gate.io исторически гораздо больше мелких
+# листингов, которые физически невозможно вычистить так же тщательно —
+# больше шансов найти настоящий, а не иллюзорный рассинхрон. Комиссии
+# ниже — ориентировочные стандартные ставки без VIP-скидок (у MEXC особо
+# низкая, 0.05% — с этим стоит свериться в реальном аккаунте, если дойдёт
+# до реальной торговли, это ведь пока только мониторинг).
 FEES = {
     "Binance": 0.10,
     "KuCoin":  0.10,
+    "HTX":     0.20,
+    "Gate":    0.20,
+    "Bitget":  0.10,
+    "MEXC":    0.05,
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -212,6 +224,109 @@ async def get_kucoin(session) -> Dict:
         return {}
 
 
+async def get_htx(session) -> Dict:
+    """HTX: один запрос отдаёт ВСЕ тикеры сразу (как Binance/KuCoin),
+    формат символа — слитные строчные буквы ("trxusdt"), без разделителя,
+    поэтому распознать base/quote можно только перебором известных
+    суффиксов (тот же приём, что уже используется для Binance)."""
+    try:
+        async with session.get(
+            "https://api.huobi.pro/market/tickers",
+            timeout=aiohttp.ClientTimeout(total=8)) as r:
+            out = {}
+            for item in (await r.json()).get("data", []):
+                sym = item.get("symbol", "").upper()
+                for q in _QUOTES_SORTED:
+                    if sym.endswith(q):
+                        base = sym[:-len(q)]
+                        if base in SYMBOLS and base != q:
+                            bid = float(item.get("bid", 0) or 0)
+                            ask = float(item.get("ask", 0) or 0)
+                            if bid > 0 and ask > 0:
+                                out[(base, q)] = {"bid": bid, "ask": ask}
+                        break
+            return out
+    except Exception as e:
+        logger.error(f"HTX: {e}")
+        return {}
+
+
+async def get_gate(session) -> Dict:
+    """Gate.io: разделитель "_" в символе ("BTC_USDT") — разбор простой,
+    без перебора суффиксов, в отличие от Binance/HTX."""
+    try:
+        async with session.get(
+            "https://api.gateio.ws/api/v4/spot/tickers",
+            timeout=aiohttp.ClientTimeout(total=8)) as r:
+            out = {}
+            for item in await r.json():
+                sym = item.get("currency_pair", "")
+                if "_" not in sym:
+                    continue
+                base, _, quote = sym.partition("_")
+                if base in SYMBOLS and quote in QUOTE_CURRENCIES and base != quote:
+                    bid = float(item.get("highest_bid", 0) or 0)
+                    ask = float(item.get("lowest_ask", 0) or 0)
+                    if bid > 0 and ask > 0:
+                        out[(base, quote)] = {"bid": bid, "ask": ask}
+            return out
+    except Exception as e:
+        logger.error(f"Gate: {e}")
+        return {}
+
+
+async def get_bitget(session) -> Dict:
+    """Bitget: слитный символ, как у Binance ("BTCUSDT") — перебор
+    суффиксов известных валют котировки."""
+    try:
+        async with session.get(
+            "https://api.bitget.com/api/v2/spot/market/tickers",
+            timeout=aiohttp.ClientTimeout(total=8)) as r:
+            out = {}
+            for item in (await r.json()).get("data", []):
+                sym = item.get("symbol", "").upper()
+                for q in _QUOTES_SORTED:
+                    if sym.endswith(q):
+                        base = sym[:-len(q)]
+                        if base in SYMBOLS and base != q:
+                            bid = float(item.get("bidPr", 0) or 0)
+                            ask = float(item.get("askPr", 0) or 0)
+                            if bid > 0 and ask > 0:
+                                out[(base, q)] = {"bid": bid, "ask": ask}
+                        break
+            return out
+    except Exception as e:
+        logger.error(f"Bitget: {e}")
+        return {}
+
+
+async def get_mexc(session) -> Dict:
+    """MEXC: тот же формат ответа, что у Binance (bookTicker) — не
+    удивительно, MEXC исторически известна максимальным охватом мелких
+    листингов среди крупных бирж, отсюда и надежда найти здесь настоящий
+    рассинхрон, который никто не успел выровнять."""
+    try:
+        async with session.get(
+            "https://api.mexc.com/api/v3/ticker/bookTicker",
+            timeout=aiohttp.ClientTimeout(total=8)) as r:
+            out = {}
+            for item in await r.json():
+                sym = item.get("symbol", "").upper()
+                for q in _QUOTES_SORTED:
+                    if sym.endswith(q):
+                        base = sym[:-len(q)]
+                        if base in SYMBOLS and base != q:
+                            bid = float(item.get("bidPrice", 0) or 0)
+                            ask = float(item.get("askPrice", 0) or 0)
+                            if bid > 0 and ask > 0:
+                                out[(base, q)] = {"bid": bid, "ask": ask}
+                        break
+            return out
+    except Exception as e:
+        logger.error(f"MEXC: {e}")
+        return {}
+
+
 # ═══════════════════════════════════════
 # РЕАЛЬНАЯ ГЛУБИНА СТАКАНА (не только top-of-book) — общие функции для
 # /depthcheck и /verify. Раньше жили только во "втором слое" (WorkerArbBot),
@@ -220,9 +335,16 @@ async def get_kucoin(session) -> Dict:
 
 def sym_binance(base: str) -> str: return f"{base}USDT"
 def sym_kucoin(base: str) -> str: return f"{base}-USDT"
+def sym_htx(base: str) -> str: return f"{base.lower()}usdt"
+def sym_gate(base: str) -> str: return f"{base}_USDT"
+def sym_bitget(base: str) -> str: return f"{base}USDT"
+def sym_mexc(base: str) -> str: return f"{base}USDT"
 
 
-SYMBOL_FMT = {"Binance": sym_binance, "KuCoin": sym_kucoin}
+SYMBOL_FMT = {
+    "Binance": sym_binance, "KuCoin": sym_kucoin, "HTX": sym_htx,
+    "Gate": sym_gate, "Bitget": sym_bitget, "MEXC": sym_mexc,
+}
 
 
 async def get_orderbook_binance(session, symbol: str):
@@ -255,7 +377,82 @@ async def get_orderbook_kucoin(session, symbol: str):
         return None
 
 
-ORDERBOOK_FN = {"Binance": get_orderbook_binance, "KuCoin": get_orderbook_kucoin}
+async def get_orderbook_htx(session, symbol: str):
+    try:
+        async with session.get("https://api.huobi.pro/market/depth",
+                                params={"symbol": symbol, "type": "step0"},
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            tick = d.get("tick", {}) or {}
+            bids = [[float(p), float(q)] for p, q in tick.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in tick.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"HTX orderbook {symbol}: {e}")
+        return None
+
+
+async def get_orderbook_gate(session, symbol: str):
+    try:
+        async with session.get("https://api.gateio.ws/api/v4/spot/order_book",
+                                params={"currency_pair": symbol, "limit": 50},
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            bids = [[float(p), float(q)] for p, q in d.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in d.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"Gate orderbook {symbol}: {e}")
+        return None
+
+
+async def get_orderbook_bitget(session, symbol: str):
+    try:
+        async with session.get("https://api.bitget.com/api/v2/spot/market/orderbook",
+                                params={"symbol": symbol, "limit": "50"},
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            data = d.get("data", {}) or {}
+            bids = [[float(p), float(q)] for p, q in data.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in data.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"Bitget orderbook {symbol}: {e}")
+        return None
+
+
+async def get_orderbook_mexc(session, symbol: str):
+    try:
+        async with session.get("https://api.mexc.com/api/v3/depth",
+                                params={"symbol": symbol, "limit": 100},
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            bids = [[float(p), float(q)] for p, q in d.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in d.get("asks", [])]
+            if not bids or not asks:
+                return None
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        logger.error(f"MEXC orderbook {symbol}: {e}")
+        return None
+
+
+ORDERBOOK_FN = {
+    "Binance": get_orderbook_binance, "KuCoin": get_orderbook_kucoin,
+    "HTX": get_orderbook_htx, "Gate": get_orderbook_gate,
+    "Bitget": get_orderbook_bitget, "MEXC": get_orderbook_mexc,
+}
+
+# Единый список для команд, которые перебирают "все биржи" —
+# используется в /exchanges, /prices, /verify, /stats и т.д., чтобы не
+# держать список в шести разных местах по отдельности.
+ALL_EXCHANGES = ["Binance", "KuCoin", "HTX", "Gate", "Bitget", "MEXC"]
 
 
 def _walk_by_notional(levels: List[list], target_notional: float):
@@ -348,8 +545,8 @@ async def reverify_with_depth(session, opp: dict) -> Optional[dict]:
 
 async def verify_candidate(session, sym: str, lot_usdt: float) -> dict:
     """ГЛАВНАЯ проверочная функция — общая для /depthcheck и /verify.
-    Проверяет РЕАЛЬНУЮ глубину стакана (не top-of-book) на Binance и
-    KuCoin, и явно сверяет цену между биржами. Кандидат считается
+    Проверяет РЕАЛЬНУЮ глубину стакана (не top-of-book) на ВСЕХ биржах
+    из ALL_EXCHANGES, и явно сверяет цену между ними. Кандидат считается
     надёжным (ok=True), только если ОДНОВРЕМЕННО:
       1) на обеих биржах есть данные,
       2) на обеих биржах >= MIN_DEPTH_LEVELS уровней с ОБЕИХ сторон
@@ -361,7 +558,7 @@ async def verify_candidate(session, sym: str, lot_usdt: float) -> dict:
     глубине (как оказалось с ZIL на Binance)."""
     row = {"symbol": sym, "exchanges": {}, "ok": True, "reasons": [], "cross_spread": None}
 
-    for ex in ("Binance", "KuCoin"):
+    for ex in ALL_EXCHANGES:
         symbol_fmt = SYMBOL_FMT[ex](sym)
         try:
             book = await ORDERBOOK_FN[ex](session, symbol_fmt)
@@ -514,10 +711,11 @@ def format_signal(opp: dict) -> str:
 
 async def fetch_all(session):
     results = await asyncio.gather(
-        get_binance(session), get_kucoin(session),
+        get_binance(session), get_kucoin(session), get_htx(session),
+        get_gate(session), get_bitget(session), get_mexc(session),
         return_exceptions=True
     )
-    ex_names = ["Binance", "KuCoin"]
+    ex_names = ALL_EXCHANGES
     all_data: Dict[tuple, Dict] = {}
     active = []
     counts = {}
@@ -658,7 +856,7 @@ async def handle_command(session, text, chat_id):
             f"в другом боте (WorkerArbBot). Этот бот НИКОГДА не отправляет реальные "
             f"ордера — такой возможности физически нет в коде.\n\n"
             f"Мониторинг: {len(SYMBOLS)} монет: {', '.join(SYMBOLS)}\n"
-            f"Площадки: Binance, KuCoin\n"
+            f"Площадки: {', '.join(ALL_EXCHANGES)}\n"
             f"Валюты котировки: {', '.join(QUOTE_CURRENCIES)}\n\n"
             f"⚙️ Лот/шаг сделки (для расчётов): `{config['lot_usdt']} USDT`-эквивалент\n"
             f"⚙️ Порог маржи: `{config['min_profit_pct']}%`\n"
@@ -771,7 +969,7 @@ async def handle_command(session, text, chat_id):
             get_binance(session), get_kucoin(session),
             return_exceptions=True
         )
-        ex_names = ["Binance", "KuCoin"]
+        ex_names = ALL_EXCHANGES
         msg = "📡 *ДИАГНОСТИКА БИРЖ*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for name, r in zip(ex_names, results):
             if isinstance(r, Exception):
@@ -829,7 +1027,7 @@ async def handle_command(session, text, chat_id):
                 continue
             ex_data = all_data.get((sym, quote), {})
             msg += f"*{sym}/{quote}:*\n"
-            for ex in ("Binance", "KuCoin"):
+            for ex in ALL_EXCHANGES:
                 if ex in ex_data:
                     d = ex_data[ex]
                     msg += f"  {ex}: bid `{d['bid']}` / ask `{d['ask']}`\n"
@@ -1022,7 +1220,7 @@ async def handle_command(session, text, chat_id):
             f"⚙️ Порог автоконвертации: {config['convert_threshold_usdt']} USDT\n"
             f"⚙️ Монет в скрининге: {len(SYMBOLS)}\n"
             f"⚙️ Валюты котировки: {', '.join(QUOTE_CURRENCIES)}\n"
-            f"⚙️ Бирж: 2 (Binance/KuCoin)\n\n"
+            f"⚙️ Бирж: {len(ALL_EXCHANGES)} ({'/'.join(ALL_EXCHANGES)})\n\n"
             f"/leaderboard — какие монеты реально сработали | /verify — проверить кандидатов по-настоящему"
         )
 
@@ -1123,7 +1321,7 @@ async def main():
         logger.error("ARB_BOT_TOKEN не установлен!")
         return
     logger.info(
-        f"ArbScreenerBot (только мониторинг) | {len(SYMBOLS)} монет | 2 биржи (Binance/KuCoin) | "
+        f"ArbScreenerBot (только мониторинг) | {len(SYMBOLS)} монет | {len(ALL_EXCHANGES)} бирж ({'/'.join(ALL_EXCHANGES)}) | "
         f"лот {config['lot_usdt']} USDT | порог {config['min_profit_pct']}% | "
         f"подозрительный спред >{SUSPICIOUS_SPREAD_PCT}% | мин. уровней стакана {MIN_DEPTH_LEVELS}"
     )
