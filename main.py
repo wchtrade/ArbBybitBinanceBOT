@@ -943,7 +943,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/scan":
-        await send_tg(session, f"🔍 Сканирую 2 биржи, {len(SYMBOLS)} монет...")
+        await send_tg(session, f"🔍 Сканирую {len(ALL_EXCHANGES)} бирж, {len(SYMBOLS)} монет...")
         opps, active = await scan_cycle(session)
         if not opps:
             await send_tg(session,
