@@ -452,7 +452,17 @@ ORDERBOOK_FN = {
 # Единый список для команд, которые перебирают "все биржи" —
 # используется в /exchanges, /prices, /verify, /stats и т.д., чтобы не
 # держать список в шести разных местах по отдельности.
-ALL_EXCHANGES = ["Binance", "KuCoin", "HTX", "Gate", "Bitget", "MEXC"]
+ALL_EXCHANGES = ["Binance", "KuCoin", "Gate", "Bitget", "MEXC"]
+# ИСПРАВЛЕНИЕ 07.08: HTX убрана из активного сканирования — обнаружено, что
+# её "все тикеры сразу" эндпоинт систематически показывает устаревшую цену
+# относительно ВСЕХ остальных пяти бирж одновременно (HTX участвовала
+# буквально в каждом маршруте с большим "сигналом" в /routes, что
+# статистически означает проблему именно с её данными, а не с рынком).
+# Честная проверка глубины (reverify_with_depth) исправно отклоняла все эти
+# сигналы (0 реальных сделок), но HTX всё равно засоряла статистику шумом,
+# мешая видеть реальные сигналы по остальным пяти биржам. Функции
+# get_htx/get_orderbook_htx оставлены в коде нетронутыми — если понадобится
+# вернуть, достаточно дописать "HTX" обратно в список выше.
 
 
 def _walk_by_notional(levels: List[list], target_notional: float):
@@ -711,7 +721,7 @@ def format_signal(opp: dict) -> str:
 
 async def fetch_all(session):
     results = await asyncio.gather(
-        get_binance(session), get_kucoin(session), get_htx(session),
+        get_binance(session), get_kucoin(session),
         get_gate(session), get_bitget(session), get_mexc(session),
         return_exceptions=True
     )
@@ -966,7 +976,7 @@ async def handle_command(session, text, chat_id):
     elif cmd == "/exchanges":
         await send_tg(session, "🔍 Проверяю каждую биржу отдельно...")
         results = await asyncio.gather(
-            get_binance(session), get_kucoin(session), get_htx(session),
+            get_binance(session), get_kucoin(session),
             get_gate(session), get_bitget(session), get_mexc(session),
             return_exceptions=True
         )
