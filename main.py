@@ -966,7 +966,8 @@ async def handle_command(session, text, chat_id):
     elif cmd == "/exchanges":
         await send_tg(session, "🔍 Проверяю каждую биржу отдельно...")
         results = await asyncio.gather(
-            get_binance(session), get_kucoin(session),
+            get_binance(session), get_kucoin(session), get_htx(session),
+            get_gate(session), get_bitget(session), get_mexc(session),
             return_exceptions=True
         )
         ex_names = ALL_EXCHANGES
