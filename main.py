@@ -891,15 +891,25 @@ async def get_price_binance_simple(session, symbol: str) -> Optional[dict]:
         return None
 
 
-def make_grid(symbol: str, low: float, high: float, levels: int, lot_usdt: float) -> dict:
+def make_grid(symbol: str, low: float, high: float, levels: int, lot_usdt: float,
+               start_price: Optional[float] = None) -> dict:
     step = (high - low) / (levels - 1)
     lines = [round(low + step * i, 8) for i in range(levels)]
     cells = []
     for i in range(levels - 1):
+        # ИСПРАВЛЕНИЕ 11.08: раньше "взвод" на покупку не учитывался — если
+        # цена стартовала НИЖЕ всего диапазона, все ячейки покупали разом
+        # в первую секунду (реальный SOL был на $75, а диапазон задали
+        # $140-160 — купились все 9 ячеек мгновенно, без единого честного
+        # "падения" цены). Теперь ячейка "взведена" на покупку, только если
+        # цена сейчас РЕАЛЬНО выше её линии покупки — иначе ждёт, пока цена
+        # сначала поднимется до этого уровня и только потом упадёт обратно.
+        buy_line = lines[i]
+        armed = (start_price is None) or (start_price > buy_line)
         cells.append({
-            "buy_line": lines[i], "sell_line": lines[i + 1],
-            "held": False, "bought_at": None,
-            "qty": lot_usdt / lines[i],
+            "buy_line": buy_line, "sell_line": lines[i + 1],
+            "held": False, "bought_at": None, "armed": armed,
+            "qty": lot_usdt / buy_line,
         })
     return {
         "symbol": symbol, "low": low, "high": high, "levels": levels, "lot_usdt": lot_usdt,
@@ -925,13 +935,20 @@ async def check_grid(session, symbol: str):
 
     for cell in grid["cells"]:
         fee = GRID_FEE_PCT / 100
-        if not cell["held"] and price["ask"] <= cell["buy_line"]:
-            cell["held"] = True
-            cell["bought_at"] = price["ask"]
-            grid["trades"] += 1
-            grid["trade_log"].append({"time": datetime.now().strftime("%H:%M:%S"),
-                                        "side": "BUY", "price": price["ask"],
-                                        "level": f"{cell['buy_line']}->{cell['sell_line']}"})
+        if not cell["held"]:
+            if cell["armed"] and price["ask"] <= cell["buy_line"]:
+                cell["held"] = True
+                cell["armed"] = False
+                cell["bought_at"] = price["ask"]
+                grid["trades"] += 1
+                grid["trade_log"].append({"time": datetime.now().strftime("%H:%M:%S"),
+                                            "side": "BUY", "price": price["ask"],
+                                            "level": f"{cell['buy_line']}->{cell['sell_line']}"})
+            elif not cell["armed"] and price["ask"] > cell["buy_line"]:
+                # Цена реально поднялась выше линии покупки — теперь
+                # честный "взвод": следующее падение до этой линии будет
+                # засчитано как настоящая покупка, не искусственный старт.
+                cell["armed"] = True
         elif cell["held"] and price["bid"] >= cell["sell_line"]:
             buy_price = cell["bought_at"]
             sell_price = price["bid"]
@@ -1097,7 +1114,7 @@ async def handle_command(session, text, chat_id):
         if not price:
             await send_tg(session, f"❌ Не нашёл цену {symbol}/USDT на Binance.")
             return
-        grids[symbol] = make_grid(symbol, low, high, levels, lot)
+        grids[symbol] = make_grid(symbol, low, high, levels, lot, start_price=price["bid"])
         in_range = "✅ текущая цена ВНУТРИ диапазона" if low <= price["bid"] <= high else \
                    "⚠️ текущая цена СЕЙЧАС ВНЕ диапазона — сетка подождёт, пока цена зайдёт внутрь"
         await send_tg(session,
