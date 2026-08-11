@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -1018,53 +1019,79 @@ async def grid_loop(session):
 # этого достаточно, чтобы увидеть порядок величины дохода.
 # ══════════════════════════════════════════════════════════════
 
-BINANCE_FUTURES_BASE = "https://fapi.binance.com"
+GATE_FUTURES_BASE = "https://api.gateio.ws/api/v4"
 funding_positions: Dict[str, dict] = {}  # symbol -> состояние симуляции
+_funding_cache: dict = {"data": None, "ts": 0.0}  # общий кэш всех тикеров, живёт 15 сек
+
+
+async def _fetch_gate_futures_tickers(session) -> List[dict]:
+    """Один запрос — сразу ВСЕ фьючерсы USDT с Gate.io, с funding_rate
+    в каждой записи. Кэшируем на 15 сек, чтобы /fundingtop и отдельные
+    /startfunding не дублировали один и тот же запрос подряд."""
+    now = time.time()
+    if _funding_cache["data"] is not None and now - _funding_cache["ts"] < 15:
+        return _funding_cache["data"]
+    try:
+        async with session.get(f"{GATE_FUTURES_BASE}/futures/usdt/tickers",
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if isinstance(data, list):
+                _funding_cache["data"] = data
+                _funding_cache["ts"] = now
+                return data
+            return []
+    except Exception as e:
+        logger.error(f"Gate futures tickers fetch: {e}")
+        return []
 
 
 async def get_funding_rate(session, symbol: str) -> Optional[dict]:
-    """Текущая ставка фандинга + время следующей выплаты, с Binance
-    Futures. lastFundingRate — ставка ЗА ОДИН интервал (обычно 8ч), НЕ
-    годовая и не дневная — с этим легко ошибиться при чтении вручную."""
-    try:
-        async with session.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/premiumIndex",
-                                params={"symbol": f"{symbol}USDT"},
-                                timeout=aiohttp.ClientTimeout(total=8)) as r:
-            d = await r.json()
-            if "lastFundingRate" not in d:
+    """ИСПРАВЛЕНИЕ 11.08 (раунд 2): Binance Futures (fapi.binance.com)
+    заблокирован для облачных IP (Railway попал под ту же раздачу, что и
+    множество облачных провайдеров). Первая попытка чинить — переключение
+    на Bybit — тоже не годится: в исходном коде УЖЕ был явный комментарий
+    "Bybit подтверждённо блокирует облачные IP через CloudFront (403)" —
+    эта проблема была найдена раньше и я её не заметил. Переключились на
+    Gate.io — тот же самый домен (api.gateio.ws), что уже подтверждённо
+    работает у вас для СПОТА в этом же файле, просто раздел /futures/
+    вместо /spot/."""
+    tickers = await _fetch_gate_futures_tickers(session)
+    contract = f"{symbol}_USDT"
+    for item in tickers:
+        if item.get("contract") == contract:
+            rate = item.get("funding_rate")
+            if rate is None:
                 return None
-            return {
-                "rate": float(d["lastFundingRate"]),
-                "mark_price": float(d.get("markPrice", 0)),
-                "next_funding_time": int(d.get("nextFundingTime", 0)),
-            }
-    except Exception as e:
-        logger.error(f"Funding rate fetch {symbol}: {e}")
-        return None
+            try:
+                return {
+                    "rate": float(rate),
+                    "mark_price": float(item.get("mark_price", 0) or 0),
+                    "next_funding_time": int(item.get("funding_next_apply", 0) or 0) * 1000,
+                }
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 async def get_all_funding_rates(session) -> List[dict]:
-    """Все символы разом — для /fundingtop, без перебора по одному."""
-    try:
-        async with session.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/premiumIndex",
-                                timeout=aiohttp.ClientTimeout(total=10)) as r:
-            data = await r.json()
-            out = []
-            for item in data:
-                sym = item.get("symbol", "")
-                if not sym.endswith("USDT"):
-                    continue
-                base = sym[:-4]
-                try:
-                    rate = float(item.get("lastFundingRate", 0))
-                except (TypeError, ValueError):
-                    continue
-                out.append({"symbol": base, "rate": rate,
-                             "mark_price": float(item.get("markPrice", 0) or 0)})
-            return out
-    except Exception as e:
-        logger.error(f"All funding rates fetch: {e}")
-        return []
+    """Все символы разом (USDT-контракты) — для /fundingtop."""
+    tickers = await _fetch_gate_futures_tickers(session)
+    out = []
+    for item in tickers:
+        contract = item.get("contract", "")
+        if not contract.endswith("_USDT"):
+            continue
+        base = contract[:-5]
+        rate = item.get("funding_rate")
+        if rate is None:
+            continue
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            continue
+        out.append({"symbol": base, "rate": rate,
+                     "mark_price": float(item.get("mark_price", 0) or 0)})
+    return out
 
 
 async def check_funding_position(session, symbol: str):
@@ -1150,7 +1177,7 @@ async def handle_command(session, text, chat_id):
             f"(глубина стакана + совпадение цены между биржами, до 8 монет)\n"
             f"/triangle — треугольный арбитраж на ВСЕХ биржах разом (новое!)\n"
             f"/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ — учебный grid-симулятор (новое!)\n"
-            f"/fundingtop — топ ставок фандинга на Binance Futures (новое!)\n"
+            f"/fundingtop — топ ставок фандинга на Gate.io Futures (новое!)\n"
             f"/startfunding СИМВОЛ КАПИТАЛ — симуляция фандинг-арбитража (новое!)\n"
             f"/report — топ-5 монет по сигналам за сессию\n"
             f"/depthcheck SYMBOL — подробная глубина стакана одной монеты\n"
@@ -1213,13 +1240,13 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/fundingtop":
-        await send_tg(session, "💸 Получаю ставки фандинга со всех фьючерсов Binance...")
+        await send_tg(session, "💸 Получаю ставки фандинга со всех фьючерсов Gate.io...")
         rates = await get_all_funding_rates(session)
         if not rates:
             await send_tg(session, "❌ Не удалось получить данные.")
             return
         rates.sort(key=lambda x: abs(x["rate"]), reverse=True)
-        msg = "💸 *ТОП-20 СТАВОК ФАНДИНГА (Binance Futures)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg = "💸 *ТОП-20 СТАВОК ФАНДИНГА (Gate.io Futures)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for r in rates[:20]:
             annual_pct = r["rate"] * 3 * 365 * 100  # грубая годовая экстраполяция
             icon = "🟢" if r["rate"] >= 0 else "🔴"
@@ -1247,7 +1274,7 @@ async def handle_command(session, text, chat_id):
             return
         info = await get_funding_rate(session, symbol)
         if not info:
-            await send_tg(session, f"❌ Не нашёл фьючерс {symbol}USDT на Binance Futures.")
+            await send_tg(session, f"❌ Не нашёл фьючерс {symbol}USDT на Gate.io Futures.")
             return
         funding_positions[symbol] = {
             "symbol": symbol, "capital_usdt": capital,
