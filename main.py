@@ -11,34 +11,9 @@ logger = logging.getLogger(__name__)
 TG_TOKEN = os.environ.get("ARB_BOT_TOKEN", "")
 CHAT_ID = None
 
-# ══════════════════════════════════════════════════════════════
-# НАЗНАЧЕНИЕ БОТА: ТОЛЬКО СКРИНИНГ / МОНИТОРИНГ, НАВСЕГДА
-#
-# ИСПРАВЛЕНО 05.08: раньше в этом же файле был встроен ВТОРОЙ слой —
-# WorkerArbBot с реальными подписанными ордерами. По вашему запросу этот
-# слой ПОЛНОСТЬЮ УДАЛЁН из файла, а не просто отключён гейтом — ни одной
-# функции, которая могла бы подписать и отправить реальный ордер на
-# биржу, в этом файле больше нет. Раз назначение бота — искать и
-# проверять новые монеты-кандидаты для WorkerArbBot (другого, отдельного
-# бота), у этого скрипта не должно быть физической возможности тронуть
-# реальные деньги, даже случайно, даже через баг в конфиге.
-#
-# Если понадобится реальная торговля по монете, которую здесь нашли —
-# она добавляется в WorkerArbBot (`/addcoin`), а не сюда.
-#
-# ВТОРОЕ ИСПРАВЛЕНИЕ 05.08 (причина: ложный сигнал по ZIL, где Binance
-# показал цену на ~10% ниже реальной при формально неплохой глубине):
-# раньше большой спред между биржами просто помечался предупреждением
-# внутри текста сигнала (легко пропустить). Теперь /depthcheck и новая
-# команда /verify явно и структурно проверяют: (а) совпадает ли цена
-# между биржами в разумных пределах, (б) достаточна ли глубина стакана с
-# обеих сторон — и только если ОБА условия выполнены, кандидат
-# помечается как заслуживающий доверия.
-# ══════════════════════════════════════════════════════════════
-
 config = {
     "min_profit_pct":  float(os.environ.get("MIN_PROFIT_PCT", "0.3")),
-    "lot_usdt":        float(os.environ.get("LOT_USDT", "100")),      # шаг лота, в USDT-эквиваленте для любой валюты котировки
+    "lot_usdt":        float(os.environ.get("LOT_USDT", "100")),
     "start_capital":   float(os.environ.get("START_CAPITAL", "10000")),
     "stop_loss_usdt":  float(os.environ.get("STOP_LOSS_USDT", "50")),
     "scan_interval":   6,
@@ -46,32 +21,10 @@ config = {
     "convert_threshold_usdt": float(os.environ.get("CONVERT_THRESHOLD_USDT", "20")),
 }
 
-# Подозрительно большой спред (в %) — почти наверняка рассинхрон/задержка
-# данных между биржами (или, как в случае с ZIL, разная стадия миграции
-# токена), а не настоящая возможность.
 SUSPICIOUS_SPREAD_PCT = 5.0
-
-# Минимум уровней стакана с ОБЕИХ сторон на КАЖДОЙ бирже, ниже которого
-# кандидат считается непроверенным (то же правило, что в /scancandidates
-# у WorkerArbBot) — тонкий стакан слишком легко даёт обманчивую картину.
 MIN_DEPTH_LEVELS = 15
-
-# Валюты-мосты для арбитража: сравниваются не только пары COIN/USDT, но и
-# COIN/BTC, COIN/ETH — это независимые от USDT-рынка стаканы.
 QUOTE_CURRENCIES = ["USDT", "BTC", "ETH"]
 
-# Bybit не используется — подтверждённо блокирует облачные IP
-# (Railway/AWS/GCP) через CloudFront (403), без VPS/прокси не лечится.
-#
-# ДОБАВЛЕНО 07.08: HTX, Gate.io, Bitget, MEXC — по вашему запросу расширяем
-# охват с 2 до 6 бирж. Смысл — увеличить "площадь поиска": Binance/KuCoin
-# оказались слишком эффективны (маркет-мейкеры вычищают почти все
-# расхождения), у MEXC и Gate.io исторически гораздо больше мелких
-# листингов, которые физически невозможно вычистить так же тщательно —
-# больше шансов найти настоящий, а не иллюзорный рассинхрон. Комиссии
-# ниже — ориентировочные стандартные ставки без VIP-скидок (у MEXC особо
-# низкая, 0.05% — с этим стоит свериться в реальном аккаунте, если дойдёт
-# до реальной торговли, это ведь пока только мониторинг).
 FEES = {
     "Binance": 0.10,
     "KuCoin":  0.10,
@@ -81,11 +34,6 @@ FEES = {
     "MEXC":    0.05,
 }
 
-# ══════════════════════════════════════════════════════════════
-# ШИРОКИЙ СПИСОК МОНЕТ ДЛЯ СКРИНИНГА — максимальный охват. Часть монет
-# может отсутствовать на одной или нескольких биржах — это нормально,
-# такие просто не попадут в сравнение (см. find_arbitrage: нужно >=2 биржи).
-# ══════════════════════════════════════════════════════════════
 SYMBOLS = [
     "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "TRX", "DOT", "AVAX",
     "LINK", "NEAR", "ATOM", "LTC", "BCH", "ETC", "BNB",
@@ -102,11 +50,6 @@ SYMBOLS = [
     "GRT", "ANKR", "SKL", "STORJ", "FIL", "AR",
     "CHZ", "GMT", "RVN", "THETA", "MASK", "GAL", "PYTH", "JUP", "JTO",
     "TON", "ORDI", "WOO", "PERP", "LRC", "BAT",
-    # ИСКЛЮЧЕНЫ 07.08: ZIL и COTI — многократно подтверждённый шум (реальный
-    # разрыв цены по ZIL из-за миграции токена, аналогичная ситуация по
-    # COTI), не реальные сигналы. Постоянно доминировали в /leaderboard и
-    # /routes, засоряя обзор. Если ситуация с миграцией токенов когда-нибудь
-    # разрешится — можно вернуть их в список вручную.
 ]
 QUOTE = "USDT"
 
@@ -173,14 +116,6 @@ def check_trade_limit() -> bool:
 
 _QUOTES_SORTED = sorted(QUOTE_CURRENCIES, key=len, reverse=True)
 
-# ИСПРАВЛЕНИЕ 05.08: для top-of-book (bid/ask) по-прежнему используем
-# публичный data-api.binance.vision — это официальный, документированный
-# Binance-эндпоинт для рыночных данных (тот же Matching Engine, что и
-# основной API), не самодельная замена. Расхождение цены по ZIL, скорее
-# всего, было связано с миграцией токена на блокчейне, а не с качеством
-# самого источника данных — но на всякий случай /depthcheck и /verify
-# теперь ВСЕГДА перепроверяют реальную глубину стакана (а не только
-# top-of-book) перед тем, как показать монету как заслуживающую доверия.
 BINANCE_MARKET_BASE = "https://data-api.binance.vision"
 
 
@@ -230,10 +165,6 @@ async def get_kucoin(session) -> Dict:
 
 
 async def get_htx(session) -> Dict:
-    """HTX: один запрос отдаёт ВСЕ тикеры сразу (как Binance/KuCoin),
-    формат символа — слитные строчные буквы ("trxusdt"), без разделителя,
-    поэтому распознать base/quote можно только перебором известных
-    суффиксов (тот же приём, что уже используется для Binance)."""
     try:
         async with session.get(
             "https://api.huobi.pro/market/tickers",
@@ -257,8 +188,6 @@ async def get_htx(session) -> Dict:
 
 
 async def get_gate(session) -> Dict:
-    """Gate.io: разделитель "_" в символе ("BTC_USDT") — разбор простой,
-    без перебора суффиксов, в отличие от Binance/HTX."""
     try:
         async with session.get(
             "https://api.gateio.ws/api/v4/spot/tickers",
@@ -281,8 +210,6 @@ async def get_gate(session) -> Dict:
 
 
 async def get_bitget(session) -> Dict:
-    """Bitget: слитный символ, как у Binance ("BTCUSDT") — перебор
-    суффиксов известных валют котировки."""
     try:
         async with session.get(
             "https://api.bitget.com/api/v2/spot/market/tickers",
@@ -306,10 +233,6 @@ async def get_bitget(session) -> Dict:
 
 
 async def get_mexc(session) -> Dict:
-    """MEXC: тот же формат ответа, что у Binance (bookTicker) — не
-    удивительно, MEXC исторически известна максимальным охватом мелких
-    листингов среди крупных бирж, отсюда и надежда найти здесь настоящий
-    рассинхрон, который никто не успел выровнять."""
     try:
         async with session.get(
             "https://api.mexc.com/api/v3/ticker/bookTicker",
@@ -331,12 +254,6 @@ async def get_mexc(session) -> Dict:
         logger.error(f"MEXC: {e}")
         return {}
 
-
-# ═══════════════════════════════════════
-# РЕАЛЬНАЯ ГЛУБИНА СТАКАНА (не только top-of-book) — общие функции для
-# /depthcheck и /verify. Раньше жили только во "втором слое" (WorkerArbBot),
-# теперь это основной инструмент проверки качества любого кандидата.
-# ═══════════════════════════════════════
 
 def sym_binance(base: str) -> str: return f"{base}USDT"
 def sym_kucoin(base: str) -> str: return f"{base}-USDT"
@@ -454,20 +371,7 @@ ORDERBOOK_FN = {
     "Bitget": get_orderbook_bitget, "MEXC": get_orderbook_mexc,
 }
 
-# Единый список для команд, которые перебирают "все биржи" —
-# используется в /exchanges, /prices, /verify, /stats и т.д., чтобы не
-# держать список в шести разных местах по отдельности.
 ALL_EXCHANGES = ["Binance", "KuCoin", "Gate", "Bitget", "MEXC"]
-# ИСПРАВЛЕНИЕ 07.08: HTX убрана из активного сканирования — обнаружено, что
-# её "все тикеры сразу" эндпоинт систематически показывает устаревшую цену
-# относительно ВСЕХ остальных пяти бирж одновременно (HTX участвовала
-# буквально в каждом маршруте с большим "сигналом" в /routes, что
-# статистически означает проблему именно с её данными, а не с рынком).
-# Честная проверка глубины (reverify_with_depth) исправно отклоняла все эти
-# сигналы (0 реальных сделок), но HTX всё равно засоряла статистику шумом,
-# мешая видеть реальные сигналы по остальным пяти биржам. Функции
-# get_htx/get_orderbook_htx оставлены в коде нетронутыми — если понадобится
-# вернуть, достаточно дописать "HTX" обратно в список выше.
 
 
 def _walk_by_notional(levels: List[list], target_notional: float):
@@ -490,9 +394,6 @@ def _walk_by_notional(levels: List[list], target_notional: float):
 
 
 def _walk_by_qty(levels: List[list], target_qty: float):
-    """Продажа: отдаём target_qty базовой монеты, получаем котируемую
-    валюту — обратная сторона _walk_by_notional. Нужна для честного
-    пересчёта ноги ПРОДАЖИ (по bid-стороне стакана)."""
     remaining = target_qty
     quote_out = 0.0
     for price, qty in levels:
@@ -508,20 +409,8 @@ def _walk_by_qty(levels: List[list], target_qty: float):
 
 
 async def reverify_with_depth(session, opp: dict) -> Optional[dict]:
-    """ИСПРАВЛЕНИЕ 06.08: раньше find_arbitrage/execute_sim работали ТОЛЬКО
-    по верхней строчке стакана (best ask/best bid) — без проверки реальной
-    глубины. Из-за этого статистика (в т.ч. "42 сделки IOST, $14 прибыли")
-    могла быть завышена относительно того, что дал бы реальный ордер с
-    проскальзыванием — WorkerArbBot считает честно через walk-the-book С
-    САМОГО НАЧАЛА, отсюда и расхождение в количестве "сигналов" между двумя
-    ботами: WorkerArbBot не глючит, монитор был излишне оптимистичен.
-    Теперь перед тем, как засчитать что-либо как сигнал/сделку, для
-    USDT-пар делается честный пересчёт по реальной глубине (как в
-    verify_candidate) — если он не подтверждает исходную оценку, сигнал не
-    принимается. Для BTC/ETH-пар пока пропускаем (редкий случай, отдельная
-    доработка при необходимости)."""
     if opp["quote"] != "USDT":
-        return opp  # не USDT-пара — честную глубину не считаем, оставляем как есть (редкий случай)
+        return opp
 
     sym = opp["symbol"]
     buy_ex, sell_ex = opp["buy_ex"], opp["sell_ex"]
@@ -548,7 +437,7 @@ async def reverify_with_depth(session, opp: dict) -> Optional[dict]:
     net_pct = profit / lot_usdt * 100
 
     if net_pct < config["min_profit_pct"]:
-        return None  # честная, учитывающая проскальзывание цена уже не проходит порог
+        return None
 
     reverified = dict(opp)
     reverified["net_pct"] = round(net_pct, 4)
@@ -559,18 +448,6 @@ async def reverify_with_depth(session, opp: dict) -> Optional[dict]:
 
 
 async def verify_candidate(session, sym: str, lot_usdt: float) -> dict:
-    """ГЛАВНАЯ проверочная функция — общая для /depthcheck и /verify.
-    Проверяет РЕАЛЬНУЮ глубину стакана (не top-of-book) на ВСЕХ биржах
-    из ALL_EXCHANGES, и явно сверяет цену между ними. Кандидат считается
-    надёжным (ok=True), только если ОДНОВРЕМЕННО:
-      1) на обеих биржах есть данные,
-      2) на обеих биржах >= MIN_DEPTH_LEVELS уровней с ОБЕИХ сторон
-         (bid и ask),
-      3) цены (best bid) между биржами не расходятся сильнее
-         SUSPICIOUS_SPREAD_PCT.
-    Именно комбинация (2)+(3) ловит и тонкий стакан (как было с ZK/RVN
-    на HTX), и рассинхрон/устаревание котировки при формально неплохой
-    глубине (как оказалось с ZIL на Binance)."""
     row = {"symbol": sym, "exchanges": {}, "ok": True, "reasons": [], "cross_spread": None}
 
     for ex in ALL_EXCHANGES:
@@ -857,6 +734,129 @@ async def execute_sim(opp: dict, session=None):
         stats["profit_since_alert"] = 0.0
 
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ 11.08: ТРЕУГОЛЬНЫЙ АРБИТРАЖ — на КАЖДОЙ бирже отдельно (не между
+# биржами — треугольник в принципе внутри одной площадки, монета не может
+# телепортироваться между биржами бесплатно). Путь: USDT -> МОСТ (BTC) ->
+# АЛЬТ -> USDT, и обратное направление. Считаем по РЕАЛЬНОЙ глубине
+# стакана (walk-the-book), теми же проверенными функциями _walk_by_notional
+# и _walk_by_qty, что уже используются для честной проверки обычного
+# арбитража — не top-of-book, который может обмануть на тонком стакане.
+#
+# Список монет для треугольника — ОТДЕЛЬНЫЙ от SYMBOLS, чтобы не сканировать
+# все ~110 монет x 5 бирж x 3 стакана сразу (это было бы полторы тысячи
+# запросов за один /triangle — слишком медленно и рискует упереться в
+# рейт-лимиты). По умолчанию — ликвидные, крупные монеты, у которых
+# реально есть и ALT/BTC, и ALT/USDT пара почти на любой бирже.
+# ═══════════════════════════════════════════════════════════════
+TRIANGLE_SYMBOLS: List[str] = ["ETH", "BNB", "SOL", "XRP", "ADA", "DOGE",
+                                "LTC", "TRX", "DOT", "AVAX", "LINK", "TON"]
+TRIANGLE_BRIDGE = "BTC"
+
+
+def fmt_pair(ex: str, base: str, quote: str) -> str:
+    """Обобщённый форматтер символа пары под конкретную биржу — то же
+    самое, что SYMBOL_FMT, но принимает ЛЮБУЮ котируемую валюту (не
+    только USDT), нужно для ноги ALT/BTC внутри треугольника."""
+    if ex == "KuCoin":
+        return f"{base}-{quote}"
+    elif ex == "Gate":
+        return f"{base}_{quote}"
+    elif ex == "HTX":
+        return f"{base.lower()}{quote.lower()}"
+    else:  # Binance, Bitget, MEXC — слитно, заглавными
+        return f"{base}{quote}"
+
+
+async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
+                                     lot_usdt: float) -> List[dict]:
+    """Считает ОБА направления треугольника USDT<->BRIDGE<->ALT на ОДНОЙ
+    бирже, по реальной глубине стакана. Возвращает список найденных
+    возможностей (обычно 0, 1 или 2 — по одной на направление)."""
+    ob_fn = ORDERBOOK_FN.get(ex)
+    if not ob_fn:
+        return []
+
+    bridge_usdt_sym = fmt_pair(ex, bridge, "USDT")
+    alt_bridge_sym = fmt_pair(ex, alt, bridge)
+    alt_usdt_sym = fmt_pair(ex, alt, "USDT")
+
+    book_bridge_usdt, book_alt_bridge, book_alt_usdt = await asyncio.gather(
+        ob_fn(session, bridge_usdt_sym),
+        ob_fn(session, alt_bridge_sym),
+        ob_fn(session, alt_usdt_sym),
+        return_exceptions=True,
+    )
+    for b in (book_bridge_usdt, book_alt_bridge, book_alt_usdt):
+        if isinstance(b, Exception) or not b or not b.get("bids") or not b.get("asks"):
+            return []  # хотя бы одной из трёх пар нет на этой бирже — треугольник не посчитать
+
+    fee = FEES.get(ex, 0.1) / 100
+    found = []
+
+    # --- Путь 1: USDT -> BRIDGE -> ALT -> USDT ---
+    bridge_qty, _, _, full1 = _walk_by_notional(book_bridge_usdt["asks"], lot_usdt)
+    if full1 and bridge_qty > 0:
+        bridge_after_fee = bridge_qty * (1 - fee)
+        alt_qty, _, _, full2 = _walk_by_notional(book_alt_bridge["asks"], bridge_after_fee)
+        if full2 and alt_qty > 0:
+            alt_after_fee = alt_qty * (1 - fee)
+            usdt_out, _, full3 = _walk_by_qty(book_alt_usdt["bids"], alt_after_fee)
+            if full3 and usdt_out > 0:
+                final_usdt = usdt_out * (1 - fee)
+                profit = final_usdt - lot_usdt
+                net_pct = profit / lot_usdt * 100
+                if net_pct >= config["min_profit_pct"]:
+                    found.append({
+                        "exchange": ex, "symbol": alt, "bridge": bridge,
+                        "path": f"USDT→{bridge}→{alt}→USDT",
+                        "net_pct": round(net_pct, 4), "profit_usdt": round(profit, 4),
+                        "levels": 3, "time": datetime.now().strftime("%H:%M:%S"),
+                    })
+
+    # --- Путь 2: USDT -> ALT -> BRIDGE -> USDT (обратное направление) ---
+    alt_qty2, _, _, full1b = _walk_by_notional(book_alt_usdt["asks"], lot_usdt)
+    if full1b and alt_qty2 > 0:
+        alt_after_fee2 = alt_qty2 * (1 - fee)
+        bridge_out, _, full2b = _walk_by_qty(book_alt_bridge["bids"], alt_after_fee2)
+        if full2b and bridge_out > 0:
+            bridge_after_fee2 = bridge_out * (1 - fee)
+            usdt_out2, _, full3b = _walk_by_qty(book_bridge_usdt["bids"], bridge_after_fee2)
+            if full3b and usdt_out2 > 0:
+                final_usdt2 = usdt_out2 * (1 - fee)
+                profit2 = final_usdt2 - lot_usdt
+                net_pct2 = profit2 / lot_usdt * 100
+                if net_pct2 >= config["min_profit_pct"]:
+                    found.append({
+                        "exchange": ex, "symbol": alt, "bridge": bridge,
+                        "path": f"USDT→{alt}→{bridge}→USDT",
+                        "net_pct": round(net_pct2, 4), "profit_usdt": round(profit2, 4),
+                        "levels": 3, "time": datetime.now().strftime("%H:%M:%S"),
+                    })
+
+    return found
+
+
+async def scan_all_triangles(session) -> List[dict]:
+    """Проверяет ВСЕ монеты из TRIANGLE_SYMBOLS на ВСЕХ биржах из
+    ALL_EXCHANGES разом — именно то, что попросили: полная картина по
+    всем площадкам одним запросом."""
+    tasks = []
+    for ex in ALL_EXCHANGES:
+        for alt in TRIANGLE_SYMBOLS:
+            if alt == TRIANGLE_BRIDGE:
+                continue
+            tasks.append(calc_triangle_on_exchange(session, ex, alt, TRIANGLE_BRIDGE, config["lot_usdt"]))
+    results_nested = await asyncio.gather(*tasks, return_exceptions=True)
+    found = []
+    for r in results_nested:
+        if isinstance(r, Exception):
+            continue
+        found.extend(r)
+    found.sort(key=lambda x: x["net_pct"], reverse=True)
+    return found
+
+
 async def handle_command(session, text, chat_id):
     global CHAT_ID
     CHAT_ID = chat_id
@@ -880,6 +880,7 @@ async def handle_command(session, text, chat_id):
             f"*Главные команды:*\n"
             f"/verify МОНЕТА1 МОНЕТА2 ... — проверить кандидатов по-настоящему "
             f"(глубина стакана + совпадение цены между биржами, до 8 монет)\n"
+            f"/triangle — треугольный арбитраж на ВСЕХ биржах разом (новое!)\n"
             f"/report — топ-5 монет по сигналам за сессию\n"
             f"/depthcheck SYMBOL — подробная глубина стакана одной монеты\n"
             f"/leaderboard — рейтинг монет по числу сигналов\n\n"
@@ -892,7 +893,55 @@ async def handle_command(session, text, chat_id):
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика | /history — последние сигналы\n"
             f"/setprofit 0.15 — порог маржи | /setlot 100 — размер лота\n"
+            f"/addtriangle SYM /removetriangle SYM — список монет для /triangle\n"
         )
+
+    elif cmd == "/triangle":
+        await send_tg(session,
+            f"🔺 Сканирую треугольный арбитраж на ВСЕХ биржах "
+            f"({', '.join(ALL_EXCHANGES)}), монеты: {', '.join(TRIANGLE_SYMBOLS)}, "
+            f"мост: {TRIANGLE_BRIDGE}...")
+        results = await scan_all_triangles(session)
+        if not results:
+            await send_tg(session,
+                f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}% "
+                f"ни на одной из {len(ALL_EXCHANGES)} бирж прямо сейчас.\n"
+                f"(Либо пары ALT/{TRIANGLE_BRIDGE} не существуют для части монет на "
+                f"части бирж — это нормально, такие комбинации просто пропускаются.)"
+            )
+        else:
+            msg = (f"🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ — ВСЕ БИРЖИ*\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+            for r in results[:10]:
+                msg += (f"*{r['exchange']}* — {r['symbol']} via {r['path']}\n"
+                        f"   Чистая: `{r['net_pct']}%` | Профит на лот "
+                        f"(${config['lot_usdt']}): `{r['profit_usdt']} USDT`\n\n")
+            await send_tg(session, msg)
+
+    elif cmd == "/addtriangle":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Добавляет монету в список для /triangle.\n"
+                f"Сейчас: {', '.join(TRIANGLE_SYMBOLS)}\n"
+                f"Пример: `/addtriangle MATIC`")
+            return
+        sym = parts[1].upper()
+        if sym in TRIANGLE_SYMBOLS:
+            await send_tg(session, f"⚠️ {sym} уже в списке треугольника.")
+            return
+        TRIANGLE_SYMBOLS.append(sym)
+        await send_tg(session, f"✅ Добавлено: {sym}\nСписок: {', '.join(TRIANGLE_SYMBOLS)}")
+
+    elif cmd == "/removetriangle":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/removetriangle MATIC`")
+            return
+        sym = parts[1].upper()
+        if sym not in TRIANGLE_SYMBOLS:
+            await send_tg(session, f"⚠️ {sym} не в списке треугольника.")
+            return
+        TRIANGLE_SYMBOLS.remove(sym)
+        await send_tg(session, f"✅ Удалено: {sym}\nСписок: {', '.join(TRIANGLE_SYMBOLS)}")
 
     elif cmd == "/verify":
         if len(parts) < 2:
@@ -904,11 +953,6 @@ async def handle_command(session, text, chat_id):
                 "Пример: `/verify TRX DOGE XRP ADA LTC TON` (до 8 монет)"
             )
             return
-        # ИСПРАВЛЕНИЕ: раньше "/verify ZIL, COTI, YFI" (с запятыми, как
-        # люди обычно и пишут через запятую) ломался — "ZIL," с запятой
-        # воспринималось как отдельный, несуществующий тикер, и биржи
-        # честно отвечали "нет данных". Теперь запятые/точки с запятой
-        # убираются, пустые токены после этого пропускаются.
         raw_candidates = " ".join(parts[1:]).replace(",", " ").replace(";", " ").split()
         candidates = [p.upper() for p in raw_candidates if p][:8]
         if not candidates:
@@ -956,20 +1000,7 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"✅ Найдено {len(opps)} сигналов! Топ-3:")
             for opp in opps[:3]:
                 await send_tg(session, format_signal(opp))
-                # ИСПРАВЛЕНИЕ 05.08: раньше симуляция сделки запускалась ДАЖЕ
-                # для сигналов с подозрительным спредом (>=SUSPICIOUS_SPREAD_PCT)
-                # — из-за этого /leaderboard оказался забит фантомной "прибылью"
-                # по ZIL/COTI (те самые монеты, что /verify уже разоблачил как
-                # рассинхрон данных), а реальные, спокойные кандидаты вроде
-                # SUSHI/IOST тонули внизу списка. Подозрительные сигналы
-                # по-прежнему показываются (с предупреждением в тексте), но
-                # больше не считаются "сделкой" и не портят статистику монеты.
                 if opp["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
-                    # ИСПРАВЛЕНИЕ 06.08: наивная top-of-book цена, по которой
-                    # находится сигнал, ещё не значит, что реальный ордер
-                    # с учётом проскальзывания даст ту же маржу — честный
-                    # пересчёт по глубине стакана (как у WorkerArbBot) может
-                    # не подтвердить исходную оценку.
                     verified = await reverify_with_depth(session, opp)
                     if verified:
                         await execute_sim(verified, session)
@@ -1276,7 +1307,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session,
             "/start /verify /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
             "/report /leaderboard /pairs /routes /balances\n"
-            "/stats /history\n"
+            "/stats /history /triangle /addtriangle /removetriangle\n"
             "/setprofit 0.15 /setlot 100\n\n"
             "Это только монитор — реальных ордеров тут нет и не будет."
         )
@@ -1339,7 +1370,8 @@ async def main():
     logger.info(
         f"ArbScreenerBot (только мониторинг) | {len(SYMBOLS)} монет | {len(ALL_EXCHANGES)} бирж ({'/'.join(ALL_EXCHANGES)}) | "
         f"лот {config['lot_usdt']} USDT | порог {config['min_profit_pct']}% | "
-        f"подозрительный спред >{SUSPICIOUS_SPREAD_PCT}% | мин. уровней стакана {MIN_DEPTH_LEVELS}"
+        f"подозрительный спред >{SUSPICIOUS_SPREAD_PCT}% | мин. уровней стакана {MIN_DEPTH_LEVELS} | "
+        f"треугольник: {len(TRIANGLE_SYMBOLS)} монет через {TRIANGLE_BRIDGE}"
     )
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
