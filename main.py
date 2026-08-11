@@ -1094,6 +1094,42 @@ async def get_all_funding_rates(session) -> List[dict]:
     return out
 
 
+async def get_funding_rate_history(session, symbol: str, limit: int = 12) -> Optional[List[dict]]:
+    """НОВОЕ 11.08: история ставки фандинга — /fundinghistory. ВАЖНО:
+    точный формат полей этого конкретного эндпоинта (в отличие от
+    тикера, который уже проверен вживую) не подтверждён на практике —
+    пробуем оба вероятных варианта именования (полные "time"/"r" и
+    сокращённые "t"/"r"), логируем сырой ответ при неудаче, чтобы одним
+    взглядом в Railway-логи починить точно, если Gate.io назвал поля
+    иначе."""
+    try:
+        async with session.get(f"{GATE_FUTURES_BASE}/futures/usdt/funding_rate",
+                                params={"contract": f"{symbol}_USDT", "limit": limit},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            if not isinstance(data, list) or not data:
+                logger.error(f"Funding history {symbol}: неожиданный формат ответа: {data}")
+                return None
+            out = []
+            for item in data:
+                ts = item.get("t") or item.get("time") or item.get("timestamp")
+                rate = item.get("r")
+                if rate is None:
+                    rate = item.get("rate") or item.get("funding_rate")
+                if ts is None or rate is None:
+                    logger.error(f"Funding history {symbol}: не нашёл поля времени/ставки "
+                                  f"в записи: {item}")
+                    continue
+                try:
+                    out.append({"time": int(ts), "rate": float(rate)})
+                except (TypeError, ValueError):
+                    continue
+            return out if out else None
+    except Exception as e:
+        logger.error(f"Funding history fetch {symbol}: {e}")
+        return None
+
+
 async def check_funding_position(session, symbol: str):
     """Раз в цикл — узнаём ТЕКУЩУЮ ставку и начисляем пропорционально
     времени, прошедшему с прошлой проверки (упрощённая, но честная по
@@ -1179,6 +1215,7 @@ async def handle_command(session, text, chat_id):
             f"/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ — учебный grid-симулятор (новое!)\n"
             f"/fundingtop — топ ставок фандинга на Gate.io Futures (новое!)\n"
             f"/startfunding СИМВОЛ КАПИТАЛ — симуляция фандинг-арбитража (новое!)\n"
+            f"/fundinghistory СИМВОЛ — история ставки за последние сутки (новое!)\n"
             f"/report — топ-5 монет по сигналам за сессию\n"
             f"/depthcheck SYMBOL — подробная глубина стакана одной монеты\n"
             f"/leaderboard — рейтинг монет по числу сигналов\n\n"
@@ -1257,6 +1294,30 @@ async def handle_command(session, text, chat_id):
                 "Годовая цифра — грубая экстраполяция ТЕКУЩЕЙ ставки, реальная ставка "
                 "меняется каждые 8 часов, не воспринимай как гарантию.\n"
                 "`/startfunding СИМВОЛ КАПИТАЛ` — запустить симуляцию по конкретной монете._")
+        await send_tg(session, msg)
+
+    elif cmd == "/fundinghistory":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/fundinghistory BTC`")
+            return
+        symbol = parts[1].upper()
+        await send_tg(session, f"📜 Смотрю историю ставки фандинга для {symbol}...")
+        history = await get_funding_rate_history(session, symbol, limit=12)
+        if not history:
+            await send_tg(session,
+                f"❌ Не удалось получить историю для {symbol} — либо такого контракта "
+                f"нет на Gate.io, либо формат ответа изменился (проверь Railway-логи, "
+                f"там будет сырой ответ биржи для диагностики).")
+            return
+        msg = f"📜 *ИСТОРИЯ ФАНДИНГА — {symbol}* (последние {len(history)} интервалов по 8ч)\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for h in history:
+            dt = datetime.fromtimestamp(h["time"]).strftime("%d.%m %H:%M")
+            icon = "🟢" if h["rate"] >= 0 else "🔴"
+            msg += f"{icon} {dt}: `{h['rate']*100:.4f}%`\n"
+        rates_only = [h["rate"] for h in history]
+        avg = sum(rates_only) / len(rates_only)
+        msg += f"\n_Средняя ставка за период: {avg*100:.4f}% — так честнее оценивать долгосрочный доход, чем по одной текущей секунде._"
         await send_tg(session, msg)
 
     elif cmd == "/startfunding":
