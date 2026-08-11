@@ -1216,6 +1216,7 @@ async def handle_command(session, text, chat_id):
             f"/fundingtop — топ ставок фандинга на Gate.io Futures (новое!)\n"
             f"/startfunding СИМВОЛ КАПИТАЛ — симуляция фандинг-арбитража (новое!)\n"
             f"/fundinghistory СИМВОЛ — история ставки за последние сутки (новое!)\n"
+            f"/dashboard — общая сводка по ВСЕМУ разом (новое!)\n"
             f"/report — топ-5 монет по сигналам за сессию\n"
             f"/depthcheck SYMBOL — подробная глубина стакана одной монеты\n"
             f"/leaderboard — рейтинг монет по числу сигналов\n\n"
@@ -1294,6 +1295,56 @@ async def handle_command(session, text, chat_id):
                 "Годовая цифра — грубая экстраполяция ТЕКУЩЕЙ ставки, реальная ставка "
                 "меняется каждые 8 часов, не воспринимай как гарантию.\n"
                 "`/startfunding СИМВОЛ КАПИТАЛ` — запустить симуляцию по конкретной монете._")
+        await send_tg(session, msg)
+
+    elif cmd == "/dashboard":
+        uptime = datetime.now() - stats["start_time"]
+        h = int(uptime.total_seconds() // 3600)
+        m = int((uptime.total_seconds() % 3600) // 60)
+
+        msg = (
+            f"🎛 *ОБЩАЯ СВОДКА — всё разом*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Аптайм бота: {h}ч {m}м\n\n"
+        )
+
+        # --- 1. Обычный скрининг арбитража ---
+        msg += (
+            f"*1️⃣ Обычный арбитраж (скрининг)*\n"
+            f"   Сканов: {stats['scans']} | Сигналов: {stats['signals']} | "
+            f"Сделок (сим.): {stats['trades_sim']}\n"
+            f"   Прибыль (сим., за всё время): `{round(stats['profit_sim'], 2)} USDT`\n\n"
+        )
+
+        # --- 2. Треугольный арбитраж ---
+        msg += (
+            f"*2️⃣ Треугольный арбитраж*\n"
+            f"   Монет в списке: {len(TRIANGLE_SYMBOLS)} ({', '.join(TRIANGLE_SYMBOLS)})\n"
+            f"   Мост: {TRIANGLE_BRIDGE} | `/triangle` — проверить прямо сейчас\n\n"
+        )
+
+        # --- 3. Grid-сетки ---
+        msg += f"*3️⃣ Grid-сетки* ({len(grids)} активных)\n"
+        if not grids:
+            msg += "   Нет активных сеток. `/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ`\n\n"
+        else:
+            for sym, g in grids.items():
+                held = sum(1 for c in g["cells"] if c["held"])
+                msg += (f"   *{sym}*: {g['trades']} сделок, прибыль "
+                        f"`{round(g['profit_usdt'],4)} USDT`, занято {held}/{len(g['cells'])} ячеек\n")
+            msg += "\n"
+
+        # --- 4. Фандинг-позиции ---
+        msg += f"*4️⃣ Фандинг-позиции* ({len(funding_positions)} активных)\n"
+        if not funding_positions:
+            msg += "   Нет активных позиций. `/startfunding СИМВОЛ КАПИТАЛ`\n"
+        else:
+            for sym, pos in funding_positions.items():
+                rate = pos.get("last_rate", 0) * 100
+                msg += (f"   *{sym}*: ставка `{rate:.4f}%`/8ч, накоплено "
+                        f"`{round(pos['accrued_usdt'],4)} USDT` за {pos['checks']} проверок\n")
+
+        msg += (f"\n_Подробности по каждому пункту: /stats, /triangle, /gridstats, "
+                f"/fundingstats — эта сводка их не заменяет, только даёт быстрый обзор._")
         await send_tg(session, msg)
 
     elif cmd == "/fundinghistory":
