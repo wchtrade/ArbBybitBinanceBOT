@@ -907,7 +907,9 @@ async def handle_command(session, text, chat_id):
                 f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}% "
                 f"ни на одной из {len(ALL_EXCHANGES)} бирж прямо сейчас.\n"
                 f"(Либо пары ALT/{TRIANGLE_BRIDGE} не существуют для части монет на "
-                f"части бирж — это нормально, такие комбинации просто пропускаются.)"
+                f"части бирж — это нормально, такие комбинации просто пропускаются.)\n\n"
+                f"Хочешь увидеть, насколько БЛИЗКО рынок подходил к порогу — "
+                f"`/triangletop` покажет лучшие результаты без фильтра."
             )
         else:
             msg = (f"🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ — ВСЕ БИРЖИ*\n"
@@ -917,6 +919,27 @@ async def handle_command(session, text, chat_id):
                         f"   Чистая: `{r['net_pct']}%` | Профит на лот "
                         f"(${config['lot_usdt']}): `{r['profit_usdt']} USDT`\n\n")
             await send_tg(session, msg)
+
+    elif cmd == "/triangletop":
+        await send_tg(session,
+            f"🔺 Сканирую БЕЗ ПОРОГА — показываю лучшие результаты, даже отрицательные, "
+            f"чтобы увидеть, насколько рынок реально близок к возможности...")
+        saved = config["min_profit_pct"]
+        config["min_profit_pct"] = -999
+        results = await scan_all_triangles(session)
+        config["min_profit_pct"] = saved
+        if not results:
+            await send_tg(session,
+                "❌ Не удалось посчитать ни одной комбинации — либо нет пар ALT/BTC "
+                "на выбранных биржах, либо сеть недоступна.")
+            return
+        msg = (f"🔺 *ТРЕУГОЛЬНИК — ТОП-15 БЕЗ ФИЛЬТРА (порог обычно {saved}%)*\n"
+               f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+        for r in results[:15]:
+            icon = "🟢" if r["net_pct"] >= saved else "🔴"
+            msg += (f"{icon} *{r['exchange']}* — {r['symbol']} via {r['path']}\n"
+                    f"   Чистая: `{r['net_pct']}%`\n\n")
+        await send_tg(session, msg)
 
     elif cmd == "/addtriangle":
         if len(parts) < 2:
