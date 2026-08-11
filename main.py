@@ -1004,6 +1004,127 @@ async def grid_loop(session):
         await asyncio.sleep(5)
 
 
+# ══════════════════════════════════════════════════════════════
+# НОВОЕ 11.08: ФАНДИНГ-АРБИТРАЖ — тоже только симуляция/мониторинг,
+# та же гарантия безопасности. Используем ПУБЛИЧНЫЙ API Binance Futures
+# (без ключей) — там же, где обычный спот, только фьючерсный раздел.
+#
+# Логика позиции: лонг на споте + шорт на фьючерсе того же объёма —
+# ценовой риск взаимно гасится, прибыль — от выплат фандинга (обычно
+# каждые 8 часов). Здесь НЕ считаем реальные 8-часовые интервалы точно —
+# упрощённо начисляем ПРОПОРЦИОНАЛЬНО прошедшему времени по ТЕКУЩЕЙ
+# ставке на момент каждой проверки. Это оценка, не точный бухгалтерский
+# расчёт (реальная ставка меняется каждые 8 часов) — для учебных целей
+# этого достаточно, чтобы увидеть порядок величины дохода.
+# ══════════════════════════════════════════════════════════════
+
+BINANCE_FUTURES_BASE = "https://fapi.binance.com"
+funding_positions: Dict[str, dict] = {}  # symbol -> состояние симуляции
+
+
+async def get_funding_rate(session, symbol: str) -> Optional[dict]:
+    """Текущая ставка фандинга + время следующей выплаты, с Binance
+    Futures. lastFundingRate — ставка ЗА ОДИН интервал (обычно 8ч), НЕ
+    годовая и не дневная — с этим легко ошибиться при чтении вручную."""
+    try:
+        async with session.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/premiumIndex",
+                                params={"symbol": f"{symbol}USDT"},
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            if "lastFundingRate" not in d:
+                return None
+            return {
+                "rate": float(d["lastFundingRate"]),
+                "mark_price": float(d.get("markPrice", 0)),
+                "next_funding_time": int(d.get("nextFundingTime", 0)),
+            }
+    except Exception as e:
+        logger.error(f"Funding rate fetch {symbol}: {e}")
+        return None
+
+
+async def get_all_funding_rates(session) -> List[dict]:
+    """Все символы разом — для /fundingtop, без перебора по одному."""
+    try:
+        async with session.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/premiumIndex",
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json()
+            out = []
+            for item in data:
+                sym = item.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                base = sym[:-4]
+                try:
+                    rate = float(item.get("lastFundingRate", 0))
+                except (TypeError, ValueError):
+                    continue
+                out.append({"symbol": base, "rate": rate,
+                             "mark_price": float(item.get("markPrice", 0) or 0)})
+            return out
+    except Exception as e:
+        logger.error(f"All funding rates fetch: {e}")
+        return []
+
+
+async def check_funding_position(session, symbol: str):
+    """Раз в цикл — узнаём ТЕКУЩУЮ ставку и начисляем пропорционально
+    времени, прошедшему с прошлой проверки (упрощённая, но честная по
+    порядку величины оценка)."""
+    pos = funding_positions.get(symbol)
+    if not pos:
+        return
+    info = await get_funding_rate(session, symbol)
+    if not info:
+        return
+
+    now = datetime.now()
+    elapsed_hours = (now - pos["last_check"]).total_seconds() / 3600
+    pos["last_check"] = now
+    pos["last_rate"] = info["rate"]
+    pos["last_mark_price"] = info["mark_price"]
+
+    # lastFundingRate — ставка ЗА 8 ЧАСОВ (стандартный интервал у
+    # большинства монет на Binance Futures). Пересчитываем на прошедшее
+    # время пропорционально.
+    accrued = pos["capital_usdt"] * info["rate"] * (elapsed_hours / 8.0)
+    pos["accrued_usdt"] += accrued
+    pos["checks"] += 1
+
+
+def format_funding_stats(pos: dict) -> str:
+    uptime = datetime.now() - pos["started_at"]
+    h = int(uptime.total_seconds() // 3600)
+    m = int((uptime.total_seconds() % 3600) // 60)
+    rate_pct = pos.get("last_rate", 0) * 100
+    daily_estimate = pos["capital_usdt"] * pos.get("last_rate", 0) * 3  # x3 интервала по 8ч = сутки
+    monthly_estimate = daily_estimate * 30
+    return (
+        f"💸 *ФАНДИНГ-ПОЗИЦИЯ — {pos['symbol']}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Схема: лонг спот + шорт фьючерс, капитал `${pos['capital_usdt']}`\n"
+        f"Работает: {h}ч {m}м | Проверок: {pos['checks']}\n\n"
+        f"📊 Текущая ставка фандинга: `{rate_pct:.4f}%` за 8ч\n"
+        f"   {'🟢 Вы ПОЛУЧАЕТЕ (шорт при положительной ставке)' if pos.get('last_rate',0) >= 0 else '🔴 Вы ПЛАТИТЕ (ставка отрицательная)'}\n\n"
+        f"💰 Накоплено (симуляция, с начала): `{round(pos['accrued_usdt'], 4)} USDT`\n\n"
+        f"📈 Оценка при ТЕКУЩЕЙ ставке (может измениться):\n"
+        f"   В день: ~`{round(daily_estimate, 4)} USDT`\n"
+        f"   В месяц: ~`{round(monthly_estimate, 2)} USDT`\n\n"
+        f"⚠️ Это СИМУЛЯЦИЯ — реальных позиций на споте/фьючерсах бот не открывает.\n"
+        f"⚠️ Не учитывает: ценовой риск при неидеальном хедже, комиссии за открытие "
+        f"позиций, риск ликвидации на плече, изменение ставки между проверками."
+    )
+
+
+async def funding_loop(session):
+    while True:
+        try:
+            for symbol in list(funding_positions.keys()):
+                await check_funding_position(session, symbol)
+        except Exception as e:
+            logger.error(f"Funding loop error: {e}")
+        await asyncio.sleep(60)  # раз в минуту достаточно — ставка не скачет быстро
+
+
 async def handle_command(session, text, chat_id):
     global CHAT_ID
     CHAT_ID = chat_id
@@ -1029,6 +1150,8 @@ async def handle_command(session, text, chat_id):
             f"(глубина стакана + совпадение цены между биржами, до 8 монет)\n"
             f"/triangle — треугольный арбитраж на ВСЕХ биржах разом (новое!)\n"
             f"/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ — учебный grid-симулятор (новое!)\n"
+            f"/fundingtop — топ ставок фандинга на Binance Futures (новое!)\n"
+            f"/startfunding СИМВОЛ КАПИТАЛ — симуляция фандинг-арбитража (новое!)\n"
             f"/report — топ-5 монет по сигналам за сессию\n"
             f"/depthcheck SYMBOL — подробная глубина стакана одной монеты\n"
             f"/leaderboard — рейтинг монет по числу сигналов\n\n"
@@ -1088,6 +1211,83 @@ async def handle_command(session, text, chat_id):
             msg += (f"{icon} *{r['exchange']}* — {r['symbol']} via {r['path']}\n"
                     f"   Чистая: `{r['net_pct']}%`\n\n")
         await send_tg(session, msg)
+
+    elif cmd == "/fundingtop":
+        await send_tg(session, "💸 Получаю ставки фандинга со всех фьючерсов Binance...")
+        rates = await get_all_funding_rates(session)
+        if not rates:
+            await send_tg(session, "❌ Не удалось получить данные.")
+            return
+        rates.sort(key=lambda x: abs(x["rate"]), reverse=True)
+        msg = "💸 *ТОП-20 СТАВОК ФАНДИНГА (Binance Futures)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for r in rates[:20]:
+            annual_pct = r["rate"] * 3 * 365 * 100  # грубая годовая экстраполяция
+            icon = "🟢" if r["rate"] >= 0 else "🔴"
+            msg += (f"{icon} *{r['symbol']}*: `{r['rate']*100:.4f}%`/8ч "
+                    f"(~{annual_pct:.0f}% годовых при неизменной ставке)\n")
+        msg += ("\n_🟢 положительная ставка = шорт получает деньги | 🔴 отрицательная = "
+                "шорт платит, лонг получает.\n"
+                "Годовая цифра — грубая экстраполяция ТЕКУЩЕЙ ставки, реальная ставка "
+                "меняется каждые 8 часов, не воспринимай как гарантию.\n"
+                "`/startfunding СИМВОЛ КАПИТАЛ` — запустить симуляцию по конкретной монете._")
+        await send_tg(session, msg)
+
+    elif cmd == "/startfunding":
+        if len(parts) < 3:
+            await send_tg(session,
+                "Пример: `/startfunding BTC 1000`\n"
+                "(монета, условный капитал в USDT для симуляции схемы "
+                "лонг-спот + шорт-фьючерс)")
+            return
+        symbol = parts[1].upper()
+        try:
+            capital = float(parts[2])
+        except Exception:
+            await send_tg(session, "❌ Капитал должен быть числом. Пример: `/startfunding BTC 1000`")
+            return
+        info = await get_funding_rate(session, symbol)
+        if not info:
+            await send_tg(session, f"❌ Не нашёл фьючерс {symbol}USDT на Binance Futures.")
+            return
+        funding_positions[symbol] = {
+            "symbol": symbol, "capital_usdt": capital,
+            "started_at": datetime.now(), "last_check": datetime.now(),
+            "last_rate": info["rate"], "last_mark_price": info["mark_price"],
+            "accrued_usdt": 0.0, "checks": 0,
+        }
+        await send_tg(session,
+            f"✅ Фандинг-позиция запущена: *{symbol}*, капитал ${capital}\n"
+            f"Текущая ставка: {info['rate']*100:.4f}%/8ч\n\n"
+            f"`/fundingstats {symbol}` — посмотреть накопленный результат."
+        )
+
+    elif cmd == "/fundingstats":
+        if len(parts) < 2:
+            if not funding_positions:
+                await send_tg(session, "Нет активных фандинг-позиций. `/startfunding СИМВОЛ КАПИТАЛ`")
+                return
+            for sym, pos in funding_positions.items():
+                await send_tg(session, format_funding_stats(pos))
+            return
+        symbol = parts[1].upper()
+        if symbol not in funding_positions:
+            await send_tg(session, f"❌ Нет активной позиции для {symbol}.")
+            return
+        await send_tg(session, format_funding_stats(funding_positions[symbol]))
+
+    elif cmd == "/stopfunding":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/stopfunding BTC`")
+            return
+        symbol = parts[1].upper()
+        if symbol not in funding_positions:
+            await send_tg(session, f"❌ Нет активной позиции для {symbol}.")
+            return
+        pos = funding_positions.pop(symbol)
+        await send_tg(session,
+            f"⏹ Позиция {symbol} остановлена.\n"
+            f"Итог: накоплено {round(pos['accrued_usdt'],4)} USDT за {pos['checks']} проверок."
+        )
 
     elif cmd == "/startgrid":
         if len(parts) < 6:
@@ -1641,9 +1841,10 @@ async def main():
             polling_loop(session),
             scan_loop(session),
             grid_loop(session),
+            funding_loop(session),
             return_exceptions=True,
         )
-        names = ["polling_loop", "scan_loop", "grid_loop"]
+        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
                 logger.error(f"Фоновая задача {name} упала с исключением: {result}")
