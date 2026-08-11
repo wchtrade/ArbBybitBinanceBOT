@@ -857,6 +857,136 @@ async def scan_all_triangles(session) -> List[dict]:
     return found
 
 
+# ══════════════════════════════════════════════════════════════
+# НОВОЕ 11.08: УЧЕБНЫЙ GRID-СИМУЛЯТОР — объединён в один бот с монитором
+# арбитража и треугольника (по вашему запросу, вместо отдельного третьего
+# бота). Та же гарантия безопасности: только симуляция на реальных ценах
+# Binance, физически не может отправить реальный ордер.
+#
+# Логика: диапазон цены [low, high], N уровней -> N-1 независимых ячеек
+# (купить на уровне i, продать на уровне i+1). После продажи ячейка сразу
+# "перевзводится" — снова готова купить, если цена опустится обратно.
+# ══════════════════════════════════════════════════════════════
+
+GRID_FEE_PCT = float(os.environ.get("GRID_FEE_PCT", "0.1"))  # Binance стандартная
+grids: Dict[str, dict] = {}
+
+
+async def get_price_binance_simple(session, symbol: str) -> Optional[dict]:
+    """Best bid/ask — переиспользуем ту же логику, что и в остальном
+    файле, но без привязки к SYMBOLS (grid должен уметь взять ЛЮБОЙ
+    тикер, не только те 110+ монет из основного скрининга)."""
+    try:
+        async with session.get(f"{BINANCE_MARKET_BASE}/api/v3/ticker/bookTicker",
+                                params={"symbol": f"{symbol}USDT"},
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            bid = float(d.get("bidPrice", 0) or 0)
+            ask = float(d.get("askPrice", 0) or 0)
+            if bid <= 0 or ask <= 0:
+                return None
+            return {"bid": bid, "ask": ask}
+    except Exception as e:
+        logger.error(f"Grid price fetch {symbol}: {e}")
+        return None
+
+
+def make_grid(symbol: str, low: float, high: float, levels: int, lot_usdt: float) -> dict:
+    step = (high - low) / (levels - 1)
+    lines = [round(low + step * i, 8) for i in range(levels)]
+    cells = []
+    for i in range(levels - 1):
+        cells.append({
+            "buy_line": lines[i], "sell_line": lines[i + 1],
+            "held": False, "bought_at": None,
+            "qty": lot_usdt / lines[i],
+        })
+    return {
+        "symbol": symbol, "low": low, "high": high, "levels": levels, "lot_usdt": lot_usdt,
+        "cells": cells, "started_at": datetime.now(), "trades": 0, "profit_usdt": 0.0,
+        "trade_log": [], "current_price": None,
+        "price_touches_below_range": 0, "price_touches_above_range": 0,
+    }
+
+
+async def check_grid(session, symbol: str):
+    grid = grids.get(symbol)
+    if not grid:
+        return
+    price = await get_price_binance_simple(session, symbol)
+    if not price:
+        return
+    grid["current_price"] = price
+
+    if price["bid"] > grid["high"]:
+        grid["price_touches_above_range"] += 1
+    elif price["ask"] < grid["low"]:
+        grid["price_touches_below_range"] += 1
+
+    for cell in grid["cells"]:
+        fee = GRID_FEE_PCT / 100
+        if not cell["held"] and price["ask"] <= cell["buy_line"]:
+            cell["held"] = True
+            cell["bought_at"] = price["ask"]
+            grid["trades"] += 1
+            grid["trade_log"].append({"time": datetime.now().strftime("%H:%M:%S"),
+                                        "side": "BUY", "price": price["ask"],
+                                        "level": f"{cell['buy_line']}->{cell['sell_line']}"})
+        elif cell["held"] and price["bid"] >= cell["sell_line"]:
+            buy_price = cell["bought_at"]
+            sell_price = price["bid"]
+            qty = cell["qty"]
+            net_profit = qty * (sell_price - buy_price) - fee * qty * (buy_price + sell_price)
+            cell["held"] = False
+            cell["bought_at"] = None
+            grid["trades"] += 1
+            grid["profit_usdt"] += net_profit
+            grid["trade_log"].append({"time": datetime.now().strftime("%H:%M:%S"),
+                                        "side": "SELL", "price": sell_price,
+                                        "level": f"{cell['buy_line']}->{cell['sell_line']}",
+                                        "profit": round(net_profit, 4)})
+    if len(grid["trade_log"]) > 200:
+        grid["trade_log"] = grid["trade_log"][-200:]
+
+
+def format_grid_stats(grid: dict) -> str:
+    uptime = datetime.now() - grid["started_at"]
+    h = int(uptime.total_seconds() // 3600)
+    m = int((uptime.total_seconds() % 3600) // 60)
+    held_cells = sum(1 for c in grid["cells"] if c["held"])
+    unrealized = sum(
+        c["qty"] * ((grid["current_price"]["bid"] if grid["current_price"] else c["bought_at"]) - c["bought_at"])
+        for c in grid["cells"] if c["held"] and c["bought_at"]
+    )
+    price_line = ""
+    if grid["current_price"]:
+        price_line = f"Текущая цена: `{grid['current_price']['bid']}` / `{grid['current_price']['ask']}` (bid/ask)\n"
+    return (
+        f"📊 *GRID — {grid['symbol']}/USDT*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Работает: {h}ч {m}м\n"
+        f"Диапазон: `{grid['low']}` — `{grid['high']}` ({grid['levels']} уровней, {len(grid['cells'])} ячеек)\n"
+        f"Лот на уровень: `${grid['lot_usdt']}`\n{price_line}\n"
+        f"✅ Сделок всего: {grid['trades']}\n"
+        f"💰 Реализованная прибыль: `{round(grid['profit_usdt'], 4)} USDT`\n"
+        f"📦 Занятых ячеек сейчас: {held_cells}/{len(grid['cells'])}\n"
+        f"📈 Незафиксированный P&L по открытым ячейкам: `{round(unrealized, 4)} USDT`\n\n"
+        f"⚠️ Цена выходила НИЖЕ диапазона: {grid['price_touches_below_range']} раз(а)\n"
+        f"⚠️ Цена выходила ВЫШЕ диапазона: {grid['price_touches_above_range']} раз(а)\n"
+        f"_(если эти числа растут — сетка простаивает, цена ушла за границы)_\n\n"
+        f"Это СИМУЛЯЦИЯ на реальных ценах Binance — реальных денег бот не касается."
+    )
+
+
+async def grid_loop(session):
+    while True:
+        try:
+            for symbol in list(grids.keys()):
+                await check_grid(session, symbol)
+        except Exception as e:
+            logger.error(f"Grid loop error: {e}")
+        await asyncio.sleep(5)
+
+
 async def handle_command(session, text, chat_id):
     global CHAT_ID
     CHAT_ID = chat_id
@@ -881,6 +1011,7 @@ async def handle_command(session, text, chat_id):
             f"/verify МОНЕТА1 МОНЕТА2 ... — проверить кандидатов по-настоящему "
             f"(глубина стакана + совпадение цены между биржами, до 8 монет)\n"
             f"/triangle — треугольный арбитраж на ВСЕХ биржах разом (новое!)\n"
+            f"/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ — учебный grid-симулятор (новое!)\n"
             f"/report — топ-5 монет по сигналам за сессию\n"
             f"/depthcheck SYMBOL — подробная глубина стакана одной монеты\n"
             f"/leaderboard — рейтинг монет по числу сигналов\n\n"
@@ -939,6 +1070,97 @@ async def handle_command(session, text, chat_id):
             icon = "🟢" if r["net_pct"] >= saved else "🔴"
             msg += (f"{icon} *{r['exchange']}* — {r['symbol']} via {r['path']}\n"
                     f"   Чистая: `{r['net_pct']}%`\n\n")
+        await send_tg(session, msg)
+
+    elif cmd == "/startgrid":
+        if len(parts) < 6:
+            await send_tg(session,
+                "Пример: `/startgrid SOL 140 160 10 20`\n"
+                "(монета, нижняя граница, верхняя граница, число уровней, лот в USDT на уровень)\n\n"
+                "Учебный grid-симулятор — реальных ордеров не отправляет, только считает "
+                "на реальных ценах Binance.")
+            return
+        try:
+            symbol = parts[1].upper()
+            low = float(parts[2])
+            high = float(parts[3])
+            levels = int(parts[4])
+            lot = float(parts[5])
+            if high <= low or levels < 2 or lot <= 0:
+                await send_tg(session, "❌ Проверь параметры: верхняя граница больше нижней, "
+                                        "уровней минимум 2, лот больше нуля.")
+                return
+        except Exception:
+            await send_tg(session, "❌ Не смог разобрать числа. Пример: `/startgrid SOL 140 160 10 20`")
+            return
+        price = await get_price_binance_simple(session, symbol)
+        if not price:
+            await send_tg(session, f"❌ Не нашёл цену {symbol}/USDT на Binance.")
+            return
+        grids[symbol] = make_grid(symbol, low, high, levels, lot)
+        in_range = "✅ текущая цена ВНУТРИ диапазона" if low <= price["bid"] <= high else \
+                   "⚠️ текущая цена СЕЙЧАС ВНЕ диапазона — сетка подождёт, пока цена зайдёт внутрь"
+        await send_tg(session,
+            f"✅ Сетка запущена: *{symbol}/USDT*\n"
+            f"Диапазон: {low} — {high}, {levels} уровней, ${lot} на уровень\n"
+            f"Текущая цена: {price['bid']}/{price['ask']}\n{in_range}\n\n"
+            f"`/gridstats {symbol}` — посмотреть прогресс."
+        )
+
+    elif cmd == "/gridstats":
+        if len(parts) < 2:
+            if not grids:
+                await send_tg(session, "Нет активных сеток. `/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ`")
+                return
+            for sym, g in grids.items():
+                await send_tg(session, format_grid_stats(g))
+            return
+        symbol = parts[1].upper()
+        if symbol not in grids:
+            await send_tg(session, f"❌ Нет активной сетки для {symbol}. `/listgrids`")
+            return
+        await send_tg(session, format_grid_stats(grids[symbol]))
+
+    elif cmd == "/gridhistory":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/gridhistory SOL`")
+            return
+        symbol = parts[1].upper()
+        if symbol not in grids:
+            await send_tg(session, f"❌ Нет активной сетки для {symbol}.")
+            return
+        log = grids[symbol]["trade_log"][-15:][::-1]
+        if not log:
+            await send_tg(session, "Пока нет сделок в этой сетке.")
+            return
+        msg = f"📋 *Последние сделки — {symbol}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for t in log:
+            if t["side"] == "BUY":
+                msg += f"🟢 {t['time']} КУПИЛ @ `{t['price']}` (ячейка {t['level']})\n"
+            else:
+                msg += f"🔴 {t['time']} ПРОДАЛ @ `{t['price']}` — прибыль `{t['profit']} USDT` (ячейка {t['level']})\n"
+        await send_tg(session, msg)
+
+    elif cmd == "/stopgrid":
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/stopgrid SOL`")
+            return
+        symbol = parts[1].upper()
+        if symbol not in grids:
+            await send_tg(session, f"❌ Нет активной сетки для {symbol}.")
+            return
+        g = grids.pop(symbol)
+        await send_tg(session,
+            f"⏹ Сетка {symbol} остановлена. Итог: {g['trades']} сделок, "
+            f"прибыль {round(g['profit_usdt'],4)} USDT.")
+
+    elif cmd == "/listgrids":
+        if not grids:
+            await send_tg(session, "Нет активных сеток.")
+            return
+        msg = "📋 *Активные сетки*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for sym, g in grids.items():
+            msg += f"*{sym}*: {g['low']}-{g['high']}, {g['trades']} сделок, {round(g['profit_usdt'],4)} USDT\n"
         await send_tg(session, msg)
 
     elif cmd == "/addtriangle":
@@ -1401,9 +1623,10 @@ async def main():
         results = await asyncio.gather(
             polling_loop(session),
             scan_loop(session),
+            grid_loop(session),
             return_exceptions=True,
         )
-        names = ["polling_loop", "scan_loop"]
+        names = ["polling_loop", "scan_loop", "grid_loop"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
                 logger.error(f"Фоновая задача {name} упала с исключением: {result}")
