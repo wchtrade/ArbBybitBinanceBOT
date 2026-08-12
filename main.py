@@ -1045,6 +1045,31 @@ async def _fetch_gate_futures_tickers(session) -> List[dict]:
         return []
 
 
+_funding_interval_cache: Dict[str, int] = {}  # symbol -> интервал в секундах, кэш навсегда в рамках сессии
+
+
+async def get_funding_interval_sec(session, symbol: str) -> int:
+    """НОВОЕ 11.08: реальный интервал выплат фандинга у КОНКРЕТНОГО
+    контракта — НЕ всегда 8 часов! Обнаружено на практике: история AI
+    показала интервалы ровно по 4 часа, а не 8, как у BTC. Gate.io прямо
+    документирует, что интервал варьируется между контрактами и может
+    даже временно меняться на 1 час при экстремальных ставках. Раньше
+    код везде считал фиксированные 8ч — для монет с более частыми
+    выплатами это ЗАНИЖАЛО оценку дохода вдвое (или больше)."""
+    if symbol in _funding_interval_cache:
+        return _funding_interval_cache[symbol]
+    try:
+        async with session.get(f"{GATE_FUTURES_BASE}/futures/usdt/contracts/{symbol}_USDT",
+                                timeout=aiohttp.ClientTimeout(total=8)) as r:
+            d = await r.json()
+            interval = int(d.get("funding_interval", 28800) or 28800)
+            _funding_interval_cache[symbol] = interval
+            return interval
+    except Exception as e:
+        logger.error(f"Funding interval fetch {symbol}: {e}")
+        return 28800  # безопасный дефолт — стандартные 8ч, если не удалось узнать точно
+
+
 async def get_funding_rate(session, symbol: str) -> Optional[dict]:
     """ИСПРАВЛЕНИЕ 11.08 (раунд 2): Binance Futures (fapi.binance.com)
     заблокирован для облачных IP (Railway попал под ту же раздачу, что и
@@ -1063,10 +1088,12 @@ async def get_funding_rate(session, symbol: str) -> Optional[dict]:
             if rate is None:
                 return None
             try:
+                interval_sec = await get_funding_interval_sec(session, symbol)
                 return {
                     "rate": float(rate),
                     "mark_price": float(item.get("mark_price", 0) or 0),
                     "next_funding_time": int(item.get("funding_next_apply", 0) or 0) * 1000,
+                    "interval_hours": interval_sec / 3600,
                 }
             except (TypeError, ValueError):
                 return None
@@ -1146,11 +1173,14 @@ async def check_funding_position(session, symbol: str):
     pos["last_check"] = now
     pos["last_rate"] = info["rate"]
     pos["last_mark_price"] = info["mark_price"]
+    pos["interval_hours"] = info["interval_hours"]
 
-    # lastFundingRate — ставка ЗА 8 ЧАСОВ (стандартный интервал у
-    # большинства монет на Binance Futures). Пересчитываем на прошедшее
-    # время пропорционально.
-    accrued = pos["capital_usdt"] * info["rate"] * (elapsed_hours / 8.0)
+    # ИСПРАВЛЕНИЕ 11.08: раньше здесь были жёстко зашитые 8 часов для
+    # ЛЮБОЙ монеты — обнаружено на практике (история AI показала интервал
+    # ровно 4ч, не 8), что это занижает оценку дохода вдвое для монет с
+    # более частыми выплатами. Теперь берём РЕАЛЬНЫЙ интервал конкретного
+    # контракта.
+    accrued = pos["capital_usdt"] * info["rate"] * (elapsed_hours / info["interval_hours"])
     pos["accrued_usdt"] += accrued
     pos["checks"] += 1
 
@@ -1160,13 +1190,16 @@ def format_funding_stats(pos: dict) -> str:
     h = int(uptime.total_seconds() // 3600)
     m = int((uptime.total_seconds() % 3600) // 60)
     rate_pct = pos.get("last_rate", 0) * 100
-    daily_estimate = pos["capital_usdt"] * pos.get("last_rate", 0) * 3  # x3 интервала по 8ч = сутки
+    interval_h = pos.get("interval_hours", 8)
+    payments_per_day = 24 / interval_h
+    daily_estimate = pos["capital_usdt"] * pos.get("last_rate", 0) * payments_per_day
     monthly_estimate = daily_estimate * 30
     return (
         f"💸 *ФАНДИНГ-ПОЗИЦИЯ — {pos['symbol']}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Схема: лонг спот + шорт фьючерс, капитал `${pos['capital_usdt']}`\n"
         f"Работает: {h}ч {m}м | Проверок: {pos['checks']}\n\n"
-        f"📊 Текущая ставка фандинга: `{rate_pct:.4f}%` за 8ч\n"
+        f"📊 Текущая ставка фандинга: `{rate_pct:.4f}%` за {interval_h:.0f}ч "
+        f"(у этой монеты именно такой интервал, не всегда 8ч!)\n"
         f"   {'🟢 Вы ПОЛУЧАЕТЕ (шорт при положительной ставке)' if pos.get('last_rate',0) >= 0 else '🔴 Вы ПЛАТИТЕ (ставка отрицательная)'}\n\n"
         f"💰 Накоплено (симуляция, с начала): `{round(pos['accrued_usdt'], 4)} USDT`\n\n"
         f"📈 Оценка при ТЕКУЩЕЙ ставке (может измениться):\n"
@@ -1186,6 +1219,42 @@ async def funding_loop(session):
         except Exception as e:
             logger.error(f"Funding loop error: {e}")
         await asyncio.sleep(60)  # раз в минуту достаточно — ставка не скачет быстро
+
+
+async def daily_digest_loop(session):
+    """НОВОЕ 12.08: раз в сутки — автоматический дайджест по всем активным
+    grid-сеткам и фандинг-позициям, без необходимости проверять вручную
+    каждый день. Задумано специально под многосуточное тестирование grid,
+    которое сейчас запускаем — чтобы просто читать одно сообщение в день,
+    а не заходить и вбивать команды."""
+    await asyncio.sleep(3600)  # первый отчёт через час после старта, не сразу
+    while True:
+        try:
+            if CHAT_ID and (grids or funding_positions):
+                msg = "🌅 *ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ — Grid и Фандинг*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                if grids:
+                    msg += "*Grid-сетки:*\n"
+                    for sym, g in grids.items():
+                        held = sum(1 for c in g["cells"] if c["held"])
+                        uptime_h = (datetime.now() - g["started_at"]).total_seconds() / 3600
+                        daily_rate = g["profit_usdt"] / uptime_h * 24 if uptime_h > 0 else 0
+                        msg += (f"  *{sym}*: {g['trades']} сделок за {uptime_h:.0f}ч, "
+                                f"прибыль `{round(g['profit_usdt'],4)} USDT` "
+                                f"(~{round(daily_rate,4)}/сутки при текущем темпе), "
+                                f"занято {held}/{len(g['cells'])}\n")
+                    msg += "\n"
+                if funding_positions:
+                    msg += "*Фандинг-позиции:*\n"
+                    for sym, pos in funding_positions.items():
+                        uptime_h = (datetime.now() - pos["started_at"]).total_seconds() / 3600
+                        daily_rate = pos["accrued_usdt"] / uptime_h * 24 if uptime_h > 0 else 0
+                        msg += (f"  *{sym}*: накоплено `{round(pos['accrued_usdt'],4)} USDT` "
+                                f"за {uptime_h:.0f}ч (~{round(daily_rate,4)}/сутки при текущем темпе)\n")
+                msg += "\n_Подробнее — /gridstats, /fundingstats. Это симуляция, не реальные ордера._"
+                await send_tg(session, msg)
+        except Exception as e:
+            logger.error(f"Daily digest error: {e}")
+        await asyncio.sleep(86400)  # раз в сутки
 
 
 async def handle_command(session, text, chat_id):
@@ -1392,11 +1461,12 @@ async def handle_command(session, text, chat_id):
             "symbol": symbol, "capital_usdt": capital,
             "started_at": datetime.now(), "last_check": datetime.now(),
             "last_rate": info["rate"], "last_mark_price": info["mark_price"],
+            "interval_hours": info["interval_hours"],
             "accrued_usdt": 0.0, "checks": 0,
         }
         await send_tg(session,
             f"✅ Фандинг-позиция запущена: *{symbol}*, капитал ${capital}\n"
-            f"Текущая ставка: {info['rate']*100:.4f}%/8ч\n\n"
+            f"Текущая ставка: {info['rate']*100:.4f}%/{info['interval_hours']:.0f}ч\n\n"
             f"`/fundingstats {symbol}` — посмотреть накопленный результат."
         )
 
@@ -1981,9 +2051,10 @@ async def main():
             scan_loop(session),
             grid_loop(session),
             funding_loop(session),
+            daily_digest_loop(session),
             return_exceptions=True,
         )
-        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop"]
+        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop", "daily_digest_loop"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
                 logger.error(f"Фоновая задача {name} упала с исключением: {result}")
