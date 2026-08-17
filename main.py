@@ -61,6 +61,12 @@ coin_stats: Dict[str, dict] = {
 }
 pair_stats: Dict[tuple, dict] = {}
 route_stats: Dict[tuple, dict] = {}
+# НОВОЕ (17.08): раньше /routecoins показывал числа из ГЛОБАЛЬНОЙ
+# coin_stats[symbol] — те же самые для любого маршрута, где монета вообще
+# встречалась (баг, обнаруженный на практике: RVN и ONE показывали
+# ОДИНАКОВЫЕ "лучшая маржа" на двух разных парах бирж). Эта структура
+# считает статистику по каждой (buy_ex, sell_ex, symbol) отдельно.
+route_coin_stats: Dict[Tuple[str, str, str], dict] = {}
 currency_balances: Dict[str, float] = {q: 0.0 for q in QUOTE_CURRENCIES if q != "USDT"}
 conversions_log: List[dict] = []
 
@@ -407,7 +413,16 @@ ORDERBOOK_FN = {
     "Bitget": get_orderbook_bitget, "MEXC": get_orderbook_mexc,
 }
 
-ALL_EXCHANGES = ["Binance", "KuCoin", "Gate", "Bitget", "MEXC"]
+# ИЗМЕНЕНО (по запросу пользователя, 17.08): раньше здесь были все 5 бирж
+# (Binance, KuCoin, Gate, Bitget, MEXC). Gate и Bitget убраны — они не
+# входят в набор верифицированных бирж, с которыми реально работает
+# WorkerArbBot (там ключи и код заведены только под Binance/KuCoin/HTX/
+# MEXC). Смысл: TrialArbBot должен искать возможности именно там, где
+# рабочий бот реально сможет их исполнить, а не на бирже, куда доступа нет.
+# Функции get_gate/get_bitget/get_orderbook_gate/get_orderbook_bitget
+# оставлены в файле нетронутыми (на случай, если понадобится вернуть) —
+# просто больше не участвуют в сканировании, т.к. не входят в этот список.
+ALL_EXCHANGES = ["Binance", "KuCoin", "HTX", "MEXC"]
 
 
 def _walk_by_notional(levels: List[list], target_notional: float):
@@ -650,9 +665,12 @@ def format_signal(opp: dict) -> str:
 
 
 async def fetch_all(session):
+    # ИЗМЕНЕНО (17.08): Gate/Bitget убраны из основного скана — см.
+    # комментарий у ALL_EXCHANGES. Порядок вызовов ДОЛЖЕН совпадать с
+    # порядком ALL_EXCHANGES, иначе результаты приклеятся не к тем биржам.
     results = await asyncio.gather(
         get_binance(session), get_kucoin(session),
-        get_gate(session), get_bitget(session), get_mexc(session),
+        get_htx(session), get_mexc(session),
         return_exceptions=True
     )
     ex_names = ALL_EXCHANGES
@@ -706,6 +724,11 @@ async def scan_cycle(session):
             rs["signals"] += 1
             rs["best_net_pct"] = max(rs["best_net_pct"], o["net_pct"])
             rs["coins"].add(f"{o['symbol']}/{o['quote']}")
+
+            rck = (o["buy_ex"], o["sell_ex"], o["symbol"])
+            rcs = route_coin_stats.setdefault(rck, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+            rcs["signals"] += 1
+            rcs["best_net_pct"] = max(rcs["best_net_pct"], o["net_pct"])
     return opps, active
 
 
@@ -746,6 +769,11 @@ async def execute_sim(opp: dict, session=None):
     rs["trades"] += 1
     rs["profit_usdt"] += opp["profit_usdt"]
     rs["coins"].add(f"{opp['symbol']}/{quote}")
+
+    rck = (opp["buy_ex"], opp["sell_ex"], opp["symbol"])
+    rcs = route_coin_stats.setdefault(rck, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+    rcs["trades"] += 1
+    rcs["profit_usdt"] += opp["profit_usdt"]
 
     if quote == "USDT":
         stats["profit_sim"] += opp["profit_usdt"]
@@ -1741,7 +1769,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, "🔍 Проверяю каждую биржу отдельно...")
         results = await asyncio.gather(
             get_binance(session), get_kucoin(session),
-            get_gate(session), get_bitget(session), get_mexc(session),
+            get_htx(session), get_mexc(session),
             return_exceptions=True
         )
         ex_names = ALL_EXCHANGES
@@ -2013,8 +2041,14 @@ async def handle_command(session, text, chat_id):
         rows = []
         for entry in rs["coins"]:
             sym = entry.split("/")[0]
-            cs = coin_stats.get(sym, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
-            rows.append((entry, cs["trades"], cs["profit_usdt"], cs["best_net_pct"]))
+            # ИСПРАВЛЕНО (17.08): раньше здесь бралась ГЛОБАЛЬНАЯ coin_stats
+            # — одни и те же числа показывались для ЛЮБОГО маршрута, где
+            # монета вообще встречалась (баг, замеченный на практике: RVN и
+            # ONE показывали одинаковую "лучшую маржу" на двух разных
+            # парах бирж). Теперь берём статистику именно ЭТОГО маршрута.
+            rcs = route_coin_stats.get((buy_ex, sell_ex, sym),
+                                        {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+            rows.append((entry, rcs["trades"], rcs["profit_usdt"], rcs["best_net_pct"]))
         # Сортировка: сначала монеты с реальными сделками (по P&L), затем
         # остальные — по лучшей когда-либо замеченной марже.
         rows.sort(key=lambda r: (r[1] > 0, r[2], r[3]), reverse=True)
@@ -2027,6 +2061,7 @@ async def handle_command(session, text, chat_id):
         if len(rows) > 40:
             msg += f"\n_...и ещё {len(rows)-40}, показаны первые 40 по релевантности._"
         msg += ("\n\n_✅ = хотя бы раз реально исполнялась (в симуляции) на ЭТОМ маршруте. "
+                "Цифры теперь именно по этому маршруту, не глобальные. "
                 "Перед добавлением в WorkerArbBot — обязательно `/verify МОНЕТА`._")
         await send_tg(session, msg)
 
