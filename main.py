@@ -429,16 +429,21 @@ ORDERBOOK_FN = {
     "Bitget": get_orderbook_bitget, "MEXC": get_orderbook_mexc,
 }
 
-# ИЗМЕНЕНО (по запросу пользователя, 17.08): раньше здесь были все 5 бирж
-# (Binance, KuCoin, Gate, Bitget, MEXC). Gate и Bitget убраны — они не
-# входят в набор верифицированных бирж, с которыми реально работает
-# WorkerArbBot (там ключи и код заведены только под Binance/KuCoin/HTX/
-# MEXC). Смысл: TrialArbBot должен искать возможности именно там, где
-# рабочий бот реально сможет их исполнить, а не на бирже, куда доступа нет.
-# Функции get_gate/get_bitget/get_orderbook_gate/get_orderbook_bitget
-# оставлены в файле нетронутыми (на случай, если понадобится вернуть) —
-# просто больше не участвуют в сканировании, т.к. не входят в этот список.
-ALL_EXCHANGES = ["Binance", "KuCoin", "HTX", "MEXC"]
+# ИЗМЕНЕНО (по запросу пользователя, 17.08, раунд 2): HTX убрана из
+# основного скана. Причина — три контрольных замера подряд (16:24, 16:25,
+# 16:41 по PYTH/USDT) показали АБСОЛЮТНО идентичную цену HTX (0.039888/
+# 0.039889) с точностью до последней цифры, при том что за это время
+# Binance/KuCoin/MEXC успевали заметно сдвинуться, а глубина стакана
+# вокруг этой "неподвижной" цены сама менялась (150/22 -> 150/21). Это
+# признак застрявшего/неживого тикера API HTX, а не реального затишья
+# рынка — реальная цена так себя не ведёт даже на низколиквидных монетах.
+# Ровно эта же биржа была источником всех "аномальных" (15-21%) сигналов
+# по RVN и ONE весь день 17.08. get_htx/get_orderbook_htx оставлены в
+# файле нетронутыми — HTX всё ещё доступна вручную через /prices
+# (SYMBOL_FMT и ORDERBOOK_FN её не теряют), просто исключена из
+# автоматического скана, чтобы не тратить внимание на заведомо
+# ненадёжные сигналы.
+ALL_EXCHANGES = ["Binance", "KuCoin", "MEXC"]
 
 
 def _walk_by_notional(levels: List[list], target_notional: float):
@@ -681,12 +686,12 @@ def format_signal(opp: dict) -> str:
 
 
 async def fetch_all(session):
-    # ИЗМЕНЕНО (17.08): Gate/Bitget убраны из основного скана — см.
-    # комментарий у ALL_EXCHANGES. Порядок вызовов ДОЛЖЕН совпадать с
-    # порядком ALL_EXCHANGES, иначе результаты приклеятся не к тем биржам.
+    # ИЗМЕНЕНО (17.08, раунд 2): HTX убрана из основного скана — см.
+    # комментарий у ALL_EXCHANGES (застрявший тикер, подтверждено 3
+    # замерами подряд). Порядок вызовов ДОЛЖЕН совпадать с порядком
+    # ALL_EXCHANGES, иначе результаты приклеятся не к тем биржам.
     results = await asyncio.gather(
-        get_binance(session), get_kucoin(session),
-        get_htx(session), get_mexc(session),
+        get_binance(session), get_kucoin(session), get_mexc(session),
         return_exceptions=True
     )
     ex_names = ALL_EXCHANGES
@@ -1795,8 +1800,7 @@ async def handle_command(session, text, chat_id):
     elif cmd == "/exchanges":
         await send_tg(session, "🔍 Проверяю каждую биржу отдельно...")
         results = await asyncio.gather(
-            get_binance(session), get_kucoin(session),
-            get_htx(session), get_mexc(session),
+            get_binance(session), get_kucoin(session), get_mexc(session),
             return_exceptions=True
         )
         ex_names = ALL_EXCHANGES
