@@ -119,6 +119,14 @@ config["auto_signal_min_pct"] = 0.3        # минимальный ЧИСТЫЙ
 config["auto_check_interval_sec"] = 60      # как часто проверять кандидатов
 AUTO_SIGNAL_COOLDOWN_SEC = 300              # не спамить по одной и той же монете чаще, чем раз в 5 мин
 
+# НОВОЕ (по прямому запросу пользователя, 17.08): какая монета СЕЙЧАС
+# реально торгуется в WorkerArbBot — нужна, чтобы зелёная карточка сразу
+# формировала готовый блок команд (/addcoin НОВАЯ → /removecoin СТАРАЯ),
+# а не только показывала цифры. TrialArbBot и WorkerArbBot — разные
+# процессы без общей памяти, поэтому это значение нужно обновлять вручную
+# командой /setrealcoin при каждой смене монеты в рабочем боте.
+config["current_real_coin"] = "RVN"
+
 # Кандидаты, которые недавно засветились сигналом на целевом маршруте —
 # наполняется внутри scan_cycle(), НЕЗАВИСИМО от того, прошёл ли сигнал
 # фильтр "подозрительности" (5%) — узкий расчёт по двум биржам надёжнее.
@@ -309,7 +317,7 @@ def get_volatility_pct(symbol: str) -> Optional[float]:
 
 async def send_tg(session, text):
     if not CHAT_ID:
-        return
+        return None
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
         async with session.post(url, json={
@@ -323,8 +331,66 @@ async def send_tg(session, text):
                 }, timeout=aiohttp.ClientTimeout(total=10)) as r2:
                     if r2.status != 200:
                         logger.error(f"TG sendMessage повтор без Markdown тоже не прошёл: HTTP {r2.status}: {await r2.text()}")
+                        return None
+                    data2 = await r2.json()
+                    return (data2.get("result") or {}).get("message_id")
+            data = await r.json()
+            return (data.get("result") or {}).get("message_id")
     except Exception as e:
         logger.error(f"TG: {e}")
+        return None
+
+
+# НОВОЕ (по прямому запросу пользователя, 17.08): закрепление важных
+# сигнальных карточек, чтобы они не терялись среди обычного потока
+# сигналов сканера — те продолжают идти как раньше, ничего не меняем в
+# их логике. Закрепляем ТОЛЬКО карточки автоанализа с зелёным вердиктом
+# (реально многообещающий кандидат) — иначе закреплений будет слишком
+# много и сам смысл потеряется. При появлении нового зелёного кандидата
+# старое закрепление снимается, остаётся только самое актуальное.
+_last_pinned_message_id: Optional[int] = None
+
+
+async def pin_message(session, message_id: int) -> None:
+    if not CHAT_ID or not message_id:
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/pinChatMessage"
+    try:
+        async with session.post(url, json={
+            "chat_id": CHAT_ID, "message_id": message_id, "disable_notification": False
+        }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                logger.error(f"TG pinChatMessage HTTP {r.status}: {await r.text()}")
+    except Exception as e:
+        logger.error(f"TG pin error: {e}")
+
+
+async def unpin_message(session, message_id: int) -> None:
+    if not CHAT_ID or not message_id:
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/unpinChatMessage"
+    try:
+        async with session.post(url, json={
+            "chat_id": CHAT_ID, "message_id": message_id
+        }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                logger.error(f"TG unpinChatMessage HTTP {r.status}: {await r.text()}")
+    except Exception as e:
+        logger.error(f"TG unpin error: {e}")
+
+
+async def send_tg_pinned(session, text: str) -> None:
+    """Отправляет сообщение и закрепляет его, предварительно открепив
+    предыдущее закреплённое авто-сообщение (если было) — чтобы в
+    закреплённых оставался только самый свежий, самый релевантный сигнал."""
+    global _last_pinned_message_id
+    message_id = await send_tg(session, text)
+    if not message_id:
+        return
+    if _last_pinned_message_id:
+        await unpin_message(session, _last_pinned_message_id)
+    await pin_message(session, message_id)
+    _last_pinned_message_id = message_id
 
 
 async def get_updates(session, offset=0):
@@ -2513,6 +2579,22 @@ async def handle_command(session, text, chat_id):
         except Exception:
             await send_tg(session, "❌ Пример: `/setautothreshold 0.5`")
 
+    elif cmd == "/setrealcoin":
+        # НОВОЕ: сообщить TrialArbBot, какая монета СЕЙЧАС реально
+        # торгуется в WorkerArbBot — используется для готовых команд
+        # переключения в зелёной карточке. Обновляй эту команду каждый
+        # раз, когда меняешь монету в рабочем боте вручную (боты не
+        # делятся памятью, это единственный способ синхронизации).
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущая монета WorkerArbBot (по данным TrialArbBot): "
+                f"*{config.get('current_real_coin', '?')}*\n\n"
+                f"Обнови её здесь, если менял монету в рабочем боте вручную:\n"
+                f"Пример: `/setrealcoin ONE`")
+            return
+        config["current_real_coin"] = parts[1].upper()
+        await send_tg(session, f"✅ Текущая монета WorkerArbBot: {config['current_real_coin']}")
+
     else:
         await send_tg(session,
             "/start /verify /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
@@ -2598,6 +2680,40 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
     verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
     verdict = verdict_obj["text"]
 
+    # НОВОЕ (по прямому запросу пользователя, 17.08): для зелёного вердикта
+    # сразу формируем готовый блок команд для копирования в WorkerArbBot —
+    # не нужно самому вспоминать порядок команд. ДОПОЛНИТЕЛЬНАЯ защита:
+    # даже при зелёном вердикте (минимум 3 точки истории) требуем ЕЩЁ
+    # больше данных (5+ точек) для самих команд — раз мы уже видели
+    # сегодня, как ONE переключался зелёный→жёлтый за одну проверку,
+    # 3 точки достаточно для вердикта, но маловато для реального решения.
+    hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol), [])
+    commands_block = ""
+    if verdict_obj["level"] == "green":
+        current_coin = config.get("current_real_coin", "")
+        if symbol == current_coin:
+            commands_block = (
+                f"\n✅ *{symbol} уже торгуется в WorkerArbBot — переключать не нужно.*\n"
+            )
+        elif len(hist) < 5:
+            commands_block = (
+                f"\n⏳ *Ещё рано формировать команды на переключение* — только "
+                f"{len(hist)} точек истории, для решения нужно минимум 5. "
+                f"Дождись следующих карточек.\n"
+            )
+        else:
+            commands_block = (
+                f"\n📋 *Готовые команды для WorkerArbBot (проверь сам перед отправкой!):*\n"
+                f"```\n"
+                f"/pause\n"
+                f"/addcoin {symbol}\n"
+                f"/removecoin {current_coin}\n"
+                f"/listcoins\n"
+                f"/realbalance\n"
+                f"/go\n"
+                f"```\n"
+            )
+
     return (
         f"🤖 *АВТО-АНАЛИЗ: {buy_ex} → {sell_ex} | {symbol}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2610,6 +2726,7 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
         f"📈 Тренд за окно: {trend}\n\n"
         f"{history_line}\n\n"
         f"*ЗАКЛЮЧЕНИЕ:* {verdict}\n"
+        f"{commands_block}"
         f"_Это всё равно не гарантия результата — рынок может измениться "
         f"за секунды между этой карточкой и реальным исполнением._\n\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
@@ -2655,7 +2772,16 @@ async def auto_signal_loop(session):
                     route_hist = route_coin_stats.get((buy_ex, sell_ex, symbol),
                                                         {"trades": 0, "profit_usdt": 0.0})
                     if CHAT_ID:
-                        await send_tg(session, format_auto_signal(check, trend, route_hist))
+                        card_text = format_auto_signal(check, trend, route_hist)
+                        verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
+                        # НОВОЕ: закрепляем только по-настоящему многообещающие
+                        # (зелёный вердикт) карточки — чтобы не потерялись среди
+                        # обычного потока сигналов сканера. Красные/жёлтые идут
+                        # обычным сообщением, без закрепления.
+                        if verdict_obj["level"] == "green":
+                            await send_tg_pinned(session, card_text)
+                        else:
+                            await send_tg(session, card_text)
                     await asyncio.sleep(0.7)
         except Exception as e:
             stats["errors"] += 1
