@@ -81,6 +81,15 @@ stats = {
 trade_history: List[dict] = []
 last_signal_time: Dict[str, float] = {}
 
+# НОВОЕ (17.08): почасовая статистика сигналов (UTC) — по запросу
+# пользователя, чтобы понять, есть ли часы суток с более активным рынком
+# на 4 верифицированных биржах, раз ~2 часа мониторинга не дали ни одной
+# правдоподобной возможности. Отдельно считаем ВСЕ сигналы и отдельно
+# ПРАВДОПОДОБНЫЕ (gross_pct < SUSPICIOUS_SPREAD_PCT) — иначе картина
+# исказится "аномальными" сигналами вроде HTX-артефактов.
+hourly_signals: Dict[int, int] = defaultdict(int)
+hourly_plausible_signals: Dict[int, int] = defaultdict(int)
+
 # ===== НОВОЕ (доработка по запросу пользователя, 17.08): отслеживание
 # волатильности по монете (USDT-пара), чтобы предупреждать в карточке
 # сигнала, если широкий спред может быть моментум-эффектом (котировки на
@@ -709,6 +718,11 @@ async def scan_cycle(session):
     opps = find_arbitrage(all_data)
     if opps:
         stats["signals"] += len(opps)
+        hour = datetime.utcnow().hour
+        hourly_signals[hour] += len(opps)
+        hourly_plausible_signals[hour] += sum(
+            1 for o in opps if o["gross_pct"] < SUSPICIOUS_SPREAD_PCT
+        )
         for o in opps:
             cs = coin_stats.setdefault(o["symbol"], {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
             cs["signals"] += 1
@@ -1382,6 +1396,7 @@ async def handle_command(session, text, chat_id):
             f"/routes — рейтинг маршрутов биржа→биржа\n"
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика | /history — последние сигналы\n"
+            f"/hours — сигналы по часам UTC (новое!)\n"
             f"/setprofit 0.15 — порог маржи | /setlot 100 — размер лота\n"
             f"/addtriangle SYM /removetriangle SYM — список монет для /triangle\n"
         )
@@ -2114,6 +2129,29 @@ async def handle_command(session, text, chat_id):
             f"⚙️ Бирж: {len(ALL_EXCHANGES)} ({'/'.join(ALL_EXCHANGES)})\n\n"
             f"/leaderboard — какие монеты реально сработали | /verify — проверить кандидатов по-настоящему"
         )
+
+    elif cmd == "/hours":
+        # НОВОЕ (17.08): по запросу пользователя — после ~2 часов без
+        # единой правдоподобной возможности на 4 верифицированных биржах,
+        # понять есть ли часы суток активнее других. Считаем ОТДЕЛЬНО все
+        # сигналы и отдельно ПРАВДОПОДОБНЫЕ (< порога подозрительности) —
+        # иначе картину исказят HTX-артефакты вроде 18-21% "маржи".
+        if not hourly_signals:
+            await send_tg(session, "Пока нет данных — дай боту поработать подольше.")
+            return
+        hour_data = [(h, hourly_signals.get(h, 0), hourly_plausible_signals.get(h, 0))
+                     for h in range(24) if hourly_signals.get(h, 0) > 0]
+        hour_data.sort(key=lambda x: x[2], reverse=True)
+        msg = "⏰ *СИГНАЛЫ ПО ЧАСАМ (UTC)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for h, total, plausible in hour_data[:12]:
+            bar = "█" * min(10, plausible // 3 + (1 if plausible else 0))
+            msg += f"*{h:02d}:00* {bar}\n   Всего сигналов: {total} | Правдоподобных (<{SUSPICIOUS_SPREAD_PCT}%): {plausible}\n\n"
+        best = max(hour_data, key=lambda x: x[2], default=None)
+        if best and best[2] > 0:
+            msg += f"🏆 Лучший час по правдоподобным сигналам: *{best[0]:02d}:00 UTC*"
+        else:
+            msg += "_Пока ни одного правдоподобного сигнала ни в один из часов — данных ещё мало, либо рынок сейчас действительно спокоен на всех 4 биржах._"
+        await send_tg(session, msg)
 
     elif cmd == "/history":
         if not trade_history:
