@@ -180,6 +180,8 @@ async def check_narrow_route(session, buy_ex: str, sell_ex: str, symbol: str,
         "profit_usdt": round(profit, 4),
         "depth_ok": True,
         "suspicious": is_suspicious,
+        "buy_levels": (len(buy_book["asks"]), len(buy_book["bids"])),
+        "sell_levels": (len(sell_book["asks"]), len(sell_book["bids"])),
     }
 
 
@@ -2479,9 +2481,16 @@ async def scan_loop(session):
 def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
     """Готовая карточка с разбором — то же самое, что мы вручную собирали
     сегодня по ONE/XTZ: цены, чистый спред, тренд, историческая
-    статистика именно на этом узком маршруте, и явная рекомендация."""
+    статистика именно на этом узком маршруте, и явная рекомендация.
+    САМОДОСТАТОЧНА: глубина и аномальность уже проверены внутри
+    check_narrow_route (именно на ЭТИХ ДВУХ биржах, без Binance/третьих
+    бирж) — отдельный /verify запускать не нужно, он может ложно
+    отказать из-за отсутствия данных на бирже, которая вообще не
+    участвует в этом маршруте (как было с LRC 17.08)."""
     buy_ex, sell_ex, symbol = check["buy_ex"], check["sell_ex"], check["symbol"]
     net_pct = check["net_pct"]
+    buy_ask_lv, buy_bid_lv = check.get("buy_levels", (0, 0))
+    sell_ask_lv, sell_bid_lv = check.get("sell_levels", (0, 0))
 
     trades = route_hist.get("trades", 0)
     profit = route_hist.get("profit_usdt", 0.0)
@@ -2501,16 +2510,17 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
     return (
         f"🤖 *АВТО-АНАЛИЗ: {buy_ex} → {sell_ex} | {symbol}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📥 Купить на {buy_ex}: `{check['buy_price']}`\n"
-        f"📤 Продать на {sell_ex}: `{check['sell_price']}`\n\n"
+        f"📥 Купить на {buy_ex}: `{check['buy_price']}` ({buy_ask_lv} ask / {buy_bid_lv} bid уровней)\n"
+        f"📤 Продать на {sell_ex}: `{check['sell_price']}` ({sell_ask_lv} ask / {sell_bid_lv} bid уровней)\n\n"
         f"📊 Спред: `{check['gross_pct']}%` | После комиссий: `{net_pct}%`\n"
+        f"✅ Глубина в порядке на обеих биржах, спред НЕ аномальный (<{SUSPICIOUS_SPREAD_PCT}%) "
+        f"— это уже полная проверка именно для этого маршрута, отдельный `/verify` не нужен "
+        f"(он может ложно отказать из-за биржи, которая тут вообще не участвует).\n\n"
         f"📈 Тренд за окно: {trend}\n\n"
         f"{history_line}\n\n"
         f"{verdict}\n"
-        f"_Это НЕ гарантия — только честный узкий расчёт (walk-the-book, "
-        f"именно между этими двумя биржами, без шума третьих). Перед "
-        f"реальным решением всё равно смотри `/verify {symbol}` и своей "
-        f"головой._\n\n"
+        f"_Это всё равно не гарантия результата — рынок может измениться "
+        f"за секунды между этой карточкой и реальным исполнением._\n\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
     )
 
