@@ -5,6 +5,7 @@ import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -73,6 +74,40 @@ stats = {
 }
 trade_history: List[dict] = []
 last_signal_time: Dict[str, float] = {}
+
+# ===== НОВОЕ (доработка по запросу пользователя, 17.08): отслеживание
+# волатильности по монете (USDT-пара), чтобы предупреждать в карточке
+# сигнала, если широкий спред может быть моментум-эффектом (котировки на
+# разных биржах обновляются с разной скоростью на быстро движущемся
+# рынке), а не устойчивой арбитражной возможностью. Обнаружено на
+# практике на RVN 17.08 — широкий "спред" во время сильного роста цены
+# дважды подряд закрылся в реальный минус в WorkerArbBot. =====
+price_history: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+PRICE_HISTORY_WINDOW_SEC = 15 * 60  # 15 минут
+
+
+def record_symbol_price(symbol: str, mid_price: float) -> None:
+    if mid_price <= 0:
+        return
+    now_ts = time.time()
+    hist = price_history[symbol]
+    hist.append((now_ts, mid_price))
+    cutoff = now_ts - PRICE_HISTORY_WINDOW_SEC
+    while hist and hist[0][0] < cutoff:
+        hist.pop(0)
+
+
+def get_volatility_pct(symbol: str) -> Optional[float]:
+    """Максимальное движение цены (в любую сторону) за последние 15 минут.
+    None, если данных ещё недостаточно (символ только что появился)."""
+    hist = price_history.get(symbol)
+    if not hist or len(hist) < 2:
+        return None
+    prices = [p for _, p in hist]
+    lo, hi = min(prices), max(prices)
+    if lo <= 0:
+        return None
+    return round((hi - lo) / lo * 100, 3)
 
 
 async def send_tg(session, text):
@@ -580,6 +615,18 @@ def format_signal(opp: dict) -> str:
             f"Проверь `/verify {opp['symbol']}` прежде чем доверять этой цифре — команда явно "
             f"сверит и глубину стакана, и совпадение цены между биржами.\n"
         )
+    # НОВОЕ (доработка 17.08): волатильность за 15 минут — широкий спред на
+    # быстро движущейся монете часто означает, что котировки разных бирж
+    # просто по-разному успевают обновляться за рынком, а не устойчивую
+    # возможность. Не блокирует сигнал, только предупреждает.
+    vol = get_volatility_pct(opp["symbol"])
+    if vol is not None and vol >= 2.0:
+        warning += (
+            f"\n🌪 *Волатильность {opp['symbol']} за 15 мин: {vol}%* — при таком движении "
+            f"спред может быть моментум-эффектом (котировки не успевают синхронизироваться "
+            f"между биржами), а не устойчивой возможностью. Перепроверь чуть позже, когда "
+            f"рынок успокоится.\n"
+        )
     return (
         f"🚨 *АРБИТРАЖ: {opp['buy_ex']} → {opp['sell_ex']}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -629,6 +676,16 @@ async def fetch_all(session):
 async def scan_cycle(session):
     stats["scans"] += 1
     all_data, active = await fetch_all(session)
+    # НОВОЕ: фиксируем среднюю цену (mid) по USDT-парам для отслеживания
+    # волатильности — используется в format_signal для предупреждения о
+    # моментум-эффекте (см. price_history выше).
+    for (base, quote), exchanges in all_data.items():
+        if quote != "USDT" or not exchanges:
+            continue
+        mids = [(d["bid"] + d["ask"]) / 2 for d in exchanges.values()
+                if d.get("bid", 0) > 0 and d.get("ask", 0) > 0]
+        if mids:
+            record_symbol_price(base, sum(mids) / len(mids))
     if len(active) < 2:
         return [], active
     opps = find_arbitrage(all_data)
@@ -1612,7 +1669,7 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, f"⚠️ {sym} не в списке треугольника.")
             return
         TRIANGLE_SYMBOLS.remove(sym)
-        await send_tg(session, f"✅ Удалено: {sym}\nСписок: {', '.join(TRIANGLE_SYMBOLS)}")
+        await send_tg(session, f"✅ Удалено: {sym}\nСписок: {', '.join(TRIANGLE_SYMBOLS) if TRIANGLE_SYMBOLS else '(пусто)'}")
 
     elif cmd == "/verify":
         if len(parts) < 2:
@@ -1796,8 +1853,24 @@ async def handle_command(session, text, chat_id):
         all_opps = find_arbitrage(all_data)
         config["min_profit_pct"] = saved_threshold
 
+        # ИЗМЕНЕНО (доработка 17.08): раньше топ-5 выбирался ТОЛЬКО по числу
+        # сигналов — там систематически доминируют крупные, высоколиквидные
+        # монеты (BNB, UNI, TAO), у которых сигналов много, а реального
+        # спреда почти никогда нет (эффективный рынок). Теперь сначала
+        # берём монеты, у которых ХОТЬ РАЗ была реальная сделка (trades>0),
+        # сортируя по P&L — это куда ближе к "что реально работает", чем
+        # "что часто мигает". Остаток топ-5 добираем как раньше.
+        by_trades = sorted(
+            [(c, cs) for c, cs in coin_stats.items() if cs["trades"] > 0],
+            key=lambda kv: kv[1]["profit_usdt"], reverse=True
+        )
+        top_coins = [c for c, _ in by_trades][:5]
         by_signals = sorted(coin_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
-        top_coins = [c for c, cs in by_signals if cs["signals"] > 0][:5]
+        for c, cs in by_signals:
+            if c not in top_coins and cs["signals"] > 0:
+                top_coins.append(c)
+            if len(top_coins) >= 5:
+                break
         if len(top_coins) < 5:
             live_ranked = sorted(SYMBOLS, key=lambda c: max(
                 [o["net_pct"] for o in all_opps if o["symbol"] == c], default=-999
@@ -1843,12 +1916,31 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/leaderboard":
+        # НОВОЕ (доработка 17.08): опциональный фильтр по конкретному
+        # маршруту биржа→биржа — `/leaderboard KuCoin MEXC`. Без фильтра
+        # рейтинг агрегирует ВСЕ биржи разом, из-за чего монета может быть
+        # топ-1 благодаря совсем другому маршруту (не тому, что реально
+        # использует WorkerArbBot) — именно так и запутались с ONE/RVN.
+        route_filter = None
+        if len(parts) >= 3:
+            buy_ex, sell_ex = parts[1], parts[2]
+            rs = route_stats.get((buy_ex, sell_ex))
+            if not rs or not rs.get("coins"):
+                await send_tg(session,
+                    f"Пока нет данных по маршруту {buy_ex} → {sell_ex}. Проверь написание "
+                    f"бирж (см. /routes) или посмотри без фильтра: `/leaderboard`")
+                return
+            route_filter = {entry.split("/")[0] for entry in rs["coins"]}
+
         ranked = sorted(coin_stats.items(), key=lambda kv: kv[1]["signals"], reverse=True)
+        if route_filter is not None:
+            ranked = [r for r in ranked if r[0] in route_filter]
         ranked = [r for r in ranked if r[1]["signals"] > 0][:20]
         if not ranked:
             await send_tg(session, "Пока нет ни одного сигнала ни по одной монете. Дай боту поработать подольше или снизь /setprofit.")
             return
-        msg = ("🏆 *РЕЙТИНГ КАНДИДАТОВ*\n(агрегат по всем валютам котировки, сортировка по числу "
+        header_route = f" — маршрут {parts[1]} → {parts[2]}" if route_filter is not None else ""
+        msg = (f"🏆 *РЕЙТИНГ КАНДИДАТОВ{header_route}*\n(сортировка по числу "
                "сигналов — но перед добавлением в реальную торговлю каждого прогони через /verify)\n"
                "━━━━━━━━━━━━━━━━━━━━━━\n\n")
         for i, (sym, cs) in enumerate(ranked, 1):
@@ -1856,7 +1948,8 @@ async def handle_command(session, text, chat_id):
                 f"{i}. *{sym}* — сигналов: `{cs['signals']}` | сделок: `{cs['trades']}` | "
                 f"P&L: `{round(cs['profit_usdt'],3)} USDT` | лучшая маржа: `{cs['best_net_pct']}%`\n"
             )
-        msg += "\n_Через какую именно валюту (USDT/BTC/ETH) — смотри /pairs_"
+        if route_filter is None:
+            msg += "\n_Через какую именно валюту (USDT/BTC/ETH) — смотри /pairs. Фильтр по маршруту: `/leaderboard БИРЖА1 БИРЖА2`_"
         await send_tg(session, msg)
 
     elif cmd == "/pairs":
@@ -1890,6 +1983,51 @@ async def handle_command(session, text, chat_id):
                 f"   Монеты: {example_coins}{more}\n\n"
             )
         msg += "_Показывает, между какими конкретно биржами арбитраж встречается чаще всего — независимо от монеты._"
+        await send_tg(session, msg)
+
+    elif cmd == "/routecoins":
+        # НОВОЕ (доработка 17.08): /routes показывает только топ-5 монет на
+        # маршрут ("и ещё 95") — этого недостаточно, чтобы найти реального
+        # кандидата для WorkerArbBot (у него маршрут ЖЁСТКО зашит в коде,
+        # напр. KuCoin→MEXC), приходится перебирать монеты руками. Эта
+        # команда даёт ПОЛНЫЙ список без обрезки, с сортировкой по тому,
+        # что реально работало (сделки > 0 и лучший P&L — выше), а не
+        # просто по алфавиту.
+        if len(parts) < 3:
+            await send_tg(session,
+                "Полный список монет с историей именно на этом маршруте (без обрезки "
+                "до топ-5, как в /routes).\n\n"
+                "Пример: `/routecoins KuCoin MEXC`"
+            )
+            return
+        buy_ex, sell_ex = parts[1], parts[2]
+        rk = (buy_ex, sell_ex)
+        rs = route_stats.get(rk)
+        if not rs or not rs.get("coins"):
+            await send_tg(session,
+                f"Пока нет данных по маршруту {buy_ex} → {sell_ex}. "
+                f"Проверь точное написание бирж (см. /routes) или дай боту поработать дольше."
+            )
+            return
+
+        rows = []
+        for entry in rs["coins"]:
+            sym = entry.split("/")[0]
+            cs = coin_stats.get(sym, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+            rows.append((entry, cs["trades"], cs["profit_usdt"], cs["best_net_pct"]))
+        # Сортировка: сначала монеты с реальными сделками (по P&L), затем
+        # остальные — по лучшей когда-либо замеченной марже.
+        rows.sort(key=lambda r: (r[1] > 0, r[2], r[3]), reverse=True)
+
+        msg = (f"🪙 *ВСЕ МОНЕТЫ — {buy_ex} → {sell_ex}* ({len(rows)} шт)\n"
+               f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+        for entry, trades, profit, best in rows[:40]:
+            mark = "✅" if trades > 0 else "➖"
+            msg += f"{mark} *{entry}* — сделок: `{trades}` | P&L: `{round(profit,3)}` | лучшая маржа: `{best}%`\n"
+        if len(rows) > 40:
+            msg += f"\n_...и ещё {len(rows)-40}, показаны первые 40 по релевантности._"
+        msg += ("\n\n_✅ = хотя бы раз реально исполнялась (в симуляции) на ЭТОМ маршруте. "
+                "Перед добавлением в WorkerArbBot — обязательно `/verify МОНЕТА`._")
         await send_tg(session, msg)
 
     elif cmd == "/balances":
