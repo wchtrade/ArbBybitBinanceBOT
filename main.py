@@ -165,12 +165,21 @@ async def check_narrow_route(session, buy_ex: str, sell_ex: str, symbol: str,
     net_pct = profit / lot_usdt * 100
     gross_pct = (avg_sell - avg_buy) / avg_buy * 100 if avg_buy > 0 else 0.0
 
+    # НОВОЕ: даже узкий двухбиржевой спред может быть аномалией — как
+    # выяснилось на практике 17.08 (RVN, MEXC устойчиво +15-17% выше
+    # остального рынка много часов подряд, при этом глубина стакана в
+    # порядке и walk-the-book честно проходит). Убирая общий 3-биржевой
+    # /verify-фильтр, мы потеряли и эту защиту — возвращаем её здесь,
+    # тем же порогом SUSPICIOUS_SPREAD_PCT, что и во всём остальном коде.
+    is_suspicious = gross_pct >= SUSPICIOUS_SPREAD_PCT
+
     return {
         "buy_ex": buy_ex, "sell_ex": sell_ex, "symbol": symbol,
         "buy_price": round(avg_buy, 8), "sell_price": round(avg_sell, 8),
         "gross_pct": round(gross_pct, 4), "net_pct": round(net_pct, 4),
         "profit_usdt": round(profit, 4),
         "depth_ok": True,
+        "suspicious": is_suspicious,
     }
 
 
@@ -2355,18 +2364,21 @@ async def handle_command(session, text, chat_id):
         # т.к. это единственный маршрут, который реально использует
         # WorkerArbBot.
         routes_str = ", ".join(f"{b}→{s}" for b, s in TARGET_ROUTES) or "(пусто)"
+        suspicious_count = stats.get("auto_signal_suspicious_skipped", 0)
         await send_tg(session,
             f"🤖 *Автоматический анализ узкого маршрута*\n\n"
             f"Отслеживаемые маршруты: {routes_str}\n"
             f"Порог для карточки (чистый спред): {config['auto_signal_min_pct']}%\n"
             f"Интервал проверки: {config['auto_check_interval_sec']} сек\n"
-            f"Кулдаун на монету: {AUTO_SIGNAL_COOLDOWN_SEC} сек\n\n"
+            f"Кулдаун на монету: {AUTO_SIGNAL_COOLDOWN_SEC} сек\n"
+            f"🚫 Отсеяно как аномальный спред (≥{SUSPICIOUS_SPREAD_PCT}%, даже между "
+            f"двумя целевыми биржами — как было с RVN на MEXC): {suspicious_count}\n\n"
             f"`/addautoroute БИРЖА1 БИРЖА2` — добавить маршрут\n"
             f"`/removeautoroute БИРЖА1 БИРЖА2` — убрать маршрут\n"
             f"`/setautothreshold N` — порог чистого спреда, %\n\n"
             f"Как только кандидат на отслеживаемом маршруте покажет чистый "
-            f"спред выше порога — прилетит карточка с разбором и трендом "
-            f"автоматически, без ручных проверок."
+            f"спред выше порога (и НЕ аномальный) — прилетит карточка с "
+            f"разбором и трендом автоматически, без ручных проверок."
         )
 
     elif cmd == "/addautoroute":
@@ -2521,6 +2533,14 @@ async def auto_signal_loop(session):
                     if not check:
                         continue
                     record_route_spread(buy_ex, sell_ex, symbol, check["net_pct"])
+
+                    if check.get("suspicious"):
+                        # Аномально широкий спред даже между двумя целевыми
+                        # биржами (как RVN на MEXC 17.08) — не карточка, а
+                        # только счётчик, чтобы не спамить заведомым артефактом.
+                        stats["auto_signal_suspicious_skipped"] = stats.get("auto_signal_suspicious_skipped", 0) + 1
+                        continue
+
                     if check["net_pct"] < config["auto_signal_min_pct"]:
                         continue
 
