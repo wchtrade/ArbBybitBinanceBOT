@@ -214,6 +214,64 @@ def get_route_spread_trend(buy_ex: str, sell_ex: str, symbol: str) -> str:
         return f"➡️ стабилен ({first_pct:+.2f}% → {last_pct:+.2f}% за {span_min} мин)"
 
 
+# НОВОЕ (по прямому запросу пользователя, 17.08 — "чтобы бот сам делал
+# заключение, а не только показывал цифры"): раньше финальный вердикт
+# ("это аномалия, не годится" / "это выглядит надёжно") каждый раз
+# формулировался вручную, глядя на цифры из чата — ИМЕННО ЭТОГО было
+# недостаточно в автоматизации. Теперь бот сам решает, основываясь на
+# ТОЙ ЖЕ логике, что применялась вручную сегодня к RVN/ONE/XTZ/LRC:
+#   - МОНОТОННЫЙ рост без единого отката, особенно если уже близко к
+#     порогу аномальности (5%) или уже за ним — прогрессирующая
+#     аномалия (паттерн LRC 17.08: 1.85→3.26→4.76→4.86→4.90→5.08%,
+#     ни одного отката).
+#   - Колебания в узком диапазоне БЕЗ устойчивого направления, спред
+#     стабильно положительный и заметно ниже порога аномальности —
+#     похоже на настоящее, ограниченное по амплитуде окно.
+#   - Иначе — рано судить, нужно больше истории.
+def get_route_spread_verdict(buy_ex: str, sell_ex: str, symbol: str) -> dict:
+    hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol), [])
+    if len(hist) < 3:
+        return {"level": "yellow",
+                "text": "🤔 Ещё рано судить — нужно минимум 3 точки истории "
+                        "(проверь `/routetrend` через пару минут)."}
+
+    values = [v for _, v in hist]
+    last = values[-1]
+
+    # Монотонность: сравниваем каждую точку со следующей, допускаем
+    # микро-шум ±0.05 п.п. как "не откат".
+    diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+    monotonic_up = all(d >= -0.05 for d in diffs) and sum(diffs) > 0.15
+    monotonic_down = all(d <= 0.05 for d in diffs) and sum(diffs) < -0.15
+
+    approaching_or_over_threshold = last >= SUSPICIOUS_SPREAD_PCT - 1.0
+
+    if monotonic_up and approaching_or_over_threshold:
+        return {"level": "red",
+                "text": f"🔴 Похоже на ПРОГРЕССИРУЮЩУЮ аномалию (та же картина, что была у "
+                        f"RVN/LRC сегодня) — монотонный рост без откатов, уже {last:+.2f}% "
+                        f"и приближается к порогу {SUSPICIOUS_SPREAD_PCT}% или уже за ним. "
+                        f"Не рекомендую рассматривать для реальной торговли."}
+
+    amplitude = max(values) - min(values)
+    stable_and_safe = (not monotonic_up and not monotonic_down
+                        and amplitude < 1.0 and 0 < last < SUSPICIOUS_SPREAD_PCT - 1.5)
+    if stable_and_safe:
+        return {"level": "green",
+                "text": f"🟢 Похоже на настоящее, ограниченное по амплитуде окно — колеблется "
+                        f"в узком диапазоне ({amplitude:.2f} п.п.), не убегает монотонно вверх. "
+                        f"Более надёжный кандидат, чем разовый широкий спред."}
+
+    if monotonic_down:
+        return {"level": "yellow",
+                "text": "📉 Разрыв закрывается сам — окно, похоже, уже уходит. "
+                        "Вряд ли стоит спешить, момент упущен или уходит."}
+
+    return {"level": "yellow",
+            "text": "🤔 Пока нет чёткого паттерна — ни устойчивого сужения, ни явной "
+                    "аномалии. Продолжаем наблюдать."}
+
+
 # ===== НОВОЕ (доработка по запросу пользователя, 17.08): отслеживание
 # волатильности по монете (USDT-пара), чтобы предупреждать в карточке
 # сигнала, если широкий спред может быть моментум-эффектом (котировки на
@@ -2405,12 +2463,14 @@ async def handle_command(session, text, chat_id):
                 continue
             found_any = True
             trend = get_route_spread_trend(buy_ex, sell_ex, symbol)
+            verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
             points_str = " → ".join(f"{pct:+.2f}%" for _, pct in hist[-8:])
             msg += (
                 f"*{buy_ex} → {sell_ex}*\n"
                 f"   Точек в окне (20 мин): {len(hist)}\n"
                 f"   Последние: {points_str}\n"
-                f"   Тренд: {trend}\n\n"
+                f"   Тренд: {trend}\n"
+                f"   *Заключение:* {verdict_obj['text']}\n\n"
             )
         if not found_any:
             msg += ("Пока нет накопленной истории — либо монета ещё не "
@@ -2535,12 +2595,8 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
         "📜 История на этом маршруте: ещё не исполнялась ни разу"
     )
 
-    if "сужается" in trend:
-        verdict = "⚠️ Окно, похоже, уже закрывается — вряд ли стоит спешить."
-    elif "расширяется" in trend:
-        verdict = "👀 Разрыв растёт — стоит последить ещё немного, прежде чем доверять."
-    else:
-        verdict = "🤔 Пока недостаточно истории, чтобы судить об устойчивости."
+    verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
+    verdict = verdict_obj["text"]
 
     return (
         f"🤖 *АВТО-АНАЛИЗ: {buy_ex} → {sell_ex} | {symbol}*\n"
@@ -2553,7 +2609,7 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
         f"(он может ложно отказать из-за биржи, которая тут вообще не участвует).\n\n"
         f"📈 Тренд за окно: {trend}\n\n"
         f"{history_line}\n\n"
-        f"{verdict}\n"
+        f"*ЗАКЛЮЧЕНИЕ:* {verdict}\n"
         f"_Это всё равно не гарантия результата — рынок может измениться "
         f"за секунды между этой карточкой и реальным исполнением._\n\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
