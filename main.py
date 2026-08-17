@@ -89,6 +89,13 @@ last_signal_time: Dict[str, float] = {}
 # исказится "аномальными" сигналами вроде HTX-артефактов.
 hourly_signals: Dict[int, int] = defaultdict(int)
 hourly_plausible_signals: Dict[int, int] = defaultdict(int)
+# НОВОЕ (доработка по запросу пользователя, 17.08): та же почасовая
+# статистика, но привязанная к конкретному маршруту биржа→биржа — общий
+# /hours размазывает картину по всем 12 маршрутам разом, а для решения
+# "когда включать WorkerArbBot" важна активность именно на его маршруте
+# (KuCoin→MEXC). Ключ: (час UTC, buy_ex, sell_ex).
+hourly_route_signals: Dict[Tuple[int, str, str], int] = defaultdict(int)
+hourly_route_plausible: Dict[Tuple[int, str, str], int] = defaultdict(int)
 
 # ===== НОВОЕ (доработка по запросу пользователя, 17.08): отслеживание
 # волатильности по монете (USDT-пара), чтобы предупреждать в карточке
@@ -743,6 +750,11 @@ async def scan_cycle(session):
             rcs = route_coin_stats.setdefault(rck, {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
             rcs["signals"] += 1
             rcs["best_net_pct"] = max(rcs["best_net_pct"], o["net_pct"])
+
+            hrk = (hour, o["buy_ex"], o["sell_ex"])
+            hourly_route_signals[hrk] += 1
+            if o["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
+                hourly_route_plausible[hrk] += 1
     return opps, active
 
 
@@ -1396,7 +1408,7 @@ async def handle_command(session, text, chat_id):
             f"/routes — рейтинг маршрутов биржа→биржа\n"
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика | /history — последние сигналы\n"
-            f"/hours — сигналы по часам UTC (новое!)\n"
+            f"/hours [БИРЖА1 БИРЖА2] — сигналы по часам UTC, можно с фильтром по маршруту (новое!)\n"
             f"/setprofit 0.15 — порог маржи | /setlot 100 — размер лота\n"
             f"/addtriangle SYM /removetriangle SYM — список монет для /triangle\n"
         )
@@ -2136,6 +2148,37 @@ async def handle_command(session, text, chat_id):
         # понять есть ли часы суток активнее других. Считаем ОТДЕЛЬНО все
         # сигналы и отдельно ПРАВДОПОДОБНЫЕ (< порога подозрительности) —
         # иначе картину исказят HTX-артефакты вроде 18-21% "маржи".
+        # ДОБАВЛЕНО (17.08, раунд 2): опциональный фильтр по конкретному
+        # маршруту — `/hours KuCoin MEXC`. Без фильтра картина размазана
+        # по всем ~12 маршрутам разом, а для решения "когда включать
+        # WorkerArbBot" важна активность именно на ЕГО маршруте.
+        if len(parts) >= 3:
+            buy_ex, sell_ex = parts[1], parts[2]
+            route_hour_data = [
+                (h, hourly_route_signals.get((h, buy_ex, sell_ex), 0),
+                 hourly_route_plausible.get((h, buy_ex, sell_ex), 0))
+                for h in range(24)
+            ]
+            route_hour_data = [r for r in route_hour_data if r[1] > 0]
+            if not route_hour_data:
+                await send_tg(session,
+                    f"Пока нет данных по маршруту {buy_ex} → {sell_ex}. "
+                    f"Проверь написание бирж (см. /routes) или дай боту поработать дольше."
+                )
+                return
+            route_hour_data.sort(key=lambda x: x[2], reverse=True)
+            msg = f"⏰ *СИГНАЛЫ ПО ЧАСАМ (UTC) — {buy_ex} → {sell_ex}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for h, total, plausible in route_hour_data[:12]:
+                bar = "█" * min(10, plausible // 3 + (1 if plausible else 0))
+                msg += f"*{h:02d}:00* {bar}\n   Всего: {total} | Правдоподобных: {plausible}\n\n"
+            best = route_hour_data[0]
+            if best[2] > 0:
+                msg += f"🏆 Лучший час на этом маршруте: *{best[0]:02d}:00 UTC*"
+            else:
+                msg += f"_Ни одного правдоподобного сигнала на {buy_ex}→{sell_ex} ни в один из часов пока._"
+            await send_tg(session, msg)
+            return
+
         if not hourly_signals:
             await send_tg(session, "Пока нет данных — дай боту поработать подольше.")
             return
