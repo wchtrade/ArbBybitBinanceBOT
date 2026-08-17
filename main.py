@@ -97,6 +97,112 @@ hourly_plausible_signals: Dict[int, int] = defaultdict(int)
 hourly_route_signals: Dict[Tuple[int, str, str], int] = defaultdict(int)
 hourly_route_plausible: Dict[Tuple[int, str, str], int] = defaultdict(int)
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ (доработка по запросу пользователя, 17.08): АВТОМАТИЧЕСКИЙ АНАЛИЗ
+# УЗКОГО МАРШРУТА — то, что мы весь вечер делали руками (/prices несколько
+# раз подряд, расчёт спреда именно между ДВУМЯ конкретными биржами, а не
+# всеми тремя как в /verify — там Binance регулярно "портил" картину
+# ложными срабатываниями). Теперь бот делает это сам, каждую минуту, по
+# каждому кандидату, который недавно засветился сигналом на целевом
+# маршруте, и присылает готовую карточку с разбором и трендом, только
+# когда есть что показать (а не спамит на каждый чих).
+#
+# TARGET_ROUTES — какие именно маршруты отслеживать. По умолчанию только
+# KuCoin→MEXC, потому что это единственный маршрут, который реально
+# использует WorkerArbBot (DEFAULT_PAIRS в его коде). Управляется через
+# /autoroutes, /addautoroute, /removeautoroute.
+# ═══════════════════════════════════════════════════════════════
+TARGET_ROUTES: List[Tuple[str, str]] = [("KuCoin", "MEXC")]
+
+config["auto_signal_min_pct"] = 0.3        # минимальный ЧИСТЫЙ (после комиссий) спред на
+                                             # узком маршруте, чтобы прислать карточку
+config["auto_check_interval_sec"] = 60      # как часто проверять кандидатов
+AUTO_SIGNAL_COOLDOWN_SEC = 300              # не спамить по одной и той же монете чаще, чем раз в 5 мин
+
+# Кандидаты, которые недавно засветились сигналом на целевом маршруте —
+# наполняется внутри scan_cycle(), НЕЗАВИСИМО от того, прошёл ли сигнал
+# фильтр "подозрительности" (5%) — узкий расчёт по двум биржам надёжнее.
+auto_route_candidates: Dict[Tuple[str, str], set] = defaultdict(set)
+
+# История чистого спреда по (buy_ex, sell_ex, symbol) — для тренда
+# (сужается/расширяется/стабилен), та же логика, что считали руками для
+# ONE и XTZ сегодня. Храним точки за последние 20 минут.
+route_symbol_spread_history: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = defaultdict(list)
+ROUTE_SPREAD_HISTORY_WINDOW_SEC = 20 * 60
+
+_last_auto_signal_time: Dict[Tuple[str, str, str], float] = {}
+
+
+async def check_narrow_route(session, buy_ex: str, sell_ex: str, symbol: str,
+                              lot_usdt: float) -> Optional[dict]:
+    """Честный расчёт спреда ИМЕННО между двумя конкретными биржами (не
+    всеми ALL_EXCHANGES разом, как /verify) — walk-the-book по реальной
+    глубине, с проверкой минимальной глубины на обеих сторонах. Это то,
+    что мы весь вечер считали руками по /prices — теперь автоматически."""
+    if buy_ex not in ORDERBOOK_FN or sell_ex not in ORDERBOOK_FN:
+        return None
+    buy_book = await ORDERBOOK_FN[buy_ex](session, SYMBOL_FMT[buy_ex](symbol))
+    sell_book = await ORDERBOOK_FN[sell_ex](session, SYMBOL_FMT[sell_ex](symbol))
+    if not buy_book or not sell_book:
+        return None
+    if (len(buy_book.get("asks", [])) < MIN_DEPTH_LEVELS or
+            len(buy_book.get("bids", [])) < MIN_DEPTH_LEVELS or
+            len(sell_book.get("asks", [])) < MIN_DEPTH_LEVELS or
+            len(sell_book.get("bids", [])) < MIN_DEPTH_LEVELS):
+        return None  # тонкий стакан хотя бы на одной стороне — не доверяем
+
+    coins, avg_buy, _, buy_full = _walk_by_notional(buy_book["asks"], lot_usdt)
+    if not buy_full or coins <= 0 or avg_buy <= 0:
+        return None
+    buy_fee = FEES.get(buy_ex, 0.1) / 100
+    coins_after_fee = coins * (1 - buy_fee)
+    quote_out, avg_sell, sell_full = _walk_by_qty(sell_book["bids"], coins_after_fee)
+    if not sell_full or quote_out <= 0:
+        return None
+    sell_fee = FEES.get(sell_ex, 0.1) / 100
+    final_usdt = quote_out * (1 - sell_fee)
+    profit = final_usdt - lot_usdt
+    net_pct = profit / lot_usdt * 100
+    gross_pct = (avg_sell - avg_buy) / avg_buy * 100 if avg_buy > 0 else 0.0
+
+    return {
+        "buy_ex": buy_ex, "sell_ex": sell_ex, "symbol": symbol,
+        "buy_price": round(avg_buy, 8), "sell_price": round(avg_sell, 8),
+        "gross_pct": round(gross_pct, 4), "net_pct": round(net_pct, 4),
+        "profit_usdt": round(profit, 4),
+        "depth_ok": True,
+    }
+
+
+def record_route_spread(buy_ex: str, sell_ex: str, symbol: str, net_pct: float) -> None:
+    now_ts = time.time()
+    key = (buy_ex, sell_ex, symbol)
+    hist = route_symbol_spread_history[key]
+    hist.append((now_ts, net_pct))
+    cutoff = now_ts - ROUTE_SPREAD_HISTORY_WINDOW_SEC
+    while hist and hist[0][0] < cutoff:
+        hist.pop(0)
+
+
+def get_route_spread_trend(buy_ex: str, sell_ex: str, symbol: str) -> str:
+    """Сравнивает первую и последнюю точку в окне — тот же способ, каким
+    мы вручную сравнивали замеры /prices сегодня. Возвращает готовую
+    короткую подпись для карточки."""
+    hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol))
+    if not hist or len(hist) < 2:
+        return "➡️ данных пока мало для тренда"
+    first_pct = hist[0][1]
+    last_pct = hist[-1][1]
+    delta = last_pct - first_pct
+    span_min = round((hist[-1][0] - hist[0][0]) / 60, 1)
+    if delta < -0.15:
+        return f"📉 сужается ({first_pct:+.2f}% → {last_pct:+.2f}% за {span_min} мин) — окно может закрыться"
+    elif delta > 0.15:
+        return f"📈 расширяется ({first_pct:+.2f}% → {last_pct:+.2f}% за {span_min} мин)"
+    else:
+        return f"➡️ стабилен ({first_pct:+.2f}% → {last_pct:+.2f}% за {span_min} мин)"
+
+
 # ===== НОВОЕ (доработка по запросу пользователя, 17.08): отслеживание
 # волатильности по монете (USDT-пара), чтобы предупреждать в карточке
 # сигнала, если широкий спред может быть моментум-эффектом (котировки на
@@ -760,6 +866,16 @@ async def scan_cycle(session):
             hourly_route_signals[hrk] += 1
             if o["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
                 hourly_route_plausible[hrk] += 1
+
+            # НОВОЕ: кандидат для автоматического анализа узкого маршрута —
+            # ДОБАВЛЯЕМ НЕЗАВИСИМО от фильтра "подозрительности". Мы на
+            # практике убедились сегодня, что общий /verify (все 3+ биржи
+            # разом) может ложно браковать монету из-за шума на бирже,
+            # которая вообще не участвует в целевом маршруте (Binance для
+            # KuCoin↔MEXC) — узкий двухбиржевой расчёт надёжнее.
+            route_key = (o["buy_ex"], o["sell_ex"])
+            if route_key in TARGET_ROUTES and o["quote"] == "USDT":
+                auto_route_candidates[route_key].add(o["symbol"])
     return opps, active
 
 
@@ -1414,6 +1530,7 @@ async def handle_command(session, text, chat_id):
             f"/balances — накопленные BTC/ETH, ожидающие конвертации\n"
             f"/stats — статистика | /history — последние сигналы\n"
             f"/hours [БИРЖА1 БИРЖА2] — сигналы по часам UTC, можно с фильтром по маршруту (новое!)\n"
+            f"/autoroutes — автоматический анализ узкого маршрута, сам присылает карточки (новое!)\n"
             f"/setprofit 0.15 — порог маржи | /setlot 100 — размер лота\n"
             f"/addtriangle SYM /removetriangle SYM — список монет для /triangle\n"
         )
@@ -2232,6 +2349,61 @@ async def handle_command(session, text, chat_id):
         except Exception:
             await send_tg(session, "❌ Пример: `/setlot 100`")
 
+    elif cmd == "/autoroutes":
+        # НОВОЕ: показать/управлять маршрутами для автоматического
+        # разбора (auto_signal_loop). По умолчанию — только KuCoin→MEXC,
+        # т.к. это единственный маршрут, который реально использует
+        # WorkerArbBot.
+        routes_str = ", ".join(f"{b}→{s}" for b, s in TARGET_ROUTES) or "(пусто)"
+        await send_tg(session,
+            f"🤖 *Автоматический анализ узкого маршрута*\n\n"
+            f"Отслеживаемые маршруты: {routes_str}\n"
+            f"Порог для карточки (чистый спред): {config['auto_signal_min_pct']}%\n"
+            f"Интервал проверки: {config['auto_check_interval_sec']} сек\n"
+            f"Кулдаун на монету: {AUTO_SIGNAL_COOLDOWN_SEC} сек\n\n"
+            f"`/addautoroute БИРЖА1 БИРЖА2` — добавить маршрут\n"
+            f"`/removeautoroute БИРЖА1 БИРЖА2` — убрать маршрут\n"
+            f"`/setautothreshold N` — порог чистого спреда, %\n\n"
+            f"Как только кандидат на отслеживаемом маршруте покажет чистый "
+            f"спред выше порога — прилетит карточка с разбором и трендом "
+            f"автоматически, без ручных проверок."
+        )
+
+    elif cmd == "/addautoroute":
+        if len(parts) < 3:
+            await send_tg(session, "Пример: `/addautoroute KuCoin MEXC`")
+            return
+        route = (parts[1], parts[2])
+        if route in TARGET_ROUTES:
+            await send_tg(session, f"⚠️ Маршрут {route[0]}→{route[1]} уже отслеживается.")
+            return
+        TARGET_ROUTES.append(route)
+        await send_tg(session, f"✅ Добавлен в автоанализ: {route[0]}→{route[1]}")
+
+    elif cmd == "/removeautoroute":
+        if len(parts) < 3:
+            await send_tg(session, "Пример: `/removeautoroute KuCoin MEXC`")
+            return
+        route = (parts[1], parts[2])
+        if route not in TARGET_ROUTES:
+            await send_tg(session, f"⚠️ Маршрут {route[0]}→{route[1]} не отслеживается.")
+            return
+        TARGET_ROUTES.remove(route)
+        await send_tg(session, f"✅ Убран из автоанализа: {route[0]}→{route[1]}")
+
+    elif cmd == "/setautothreshold":
+        if len(parts) < 2:
+            await send_tg(session,
+                f"Текущий порог: {config['auto_signal_min_pct']}% (чистый спред после комиссий)\n"
+                f"Пример: `/setautothreshold 0.5`")
+            return
+        try:
+            val = float(parts[1])
+            config["auto_signal_min_pct"] = val
+            await send_tg(session, f"✅ Порог автосигнала: {val}%")
+        except Exception:
+            await send_tg(session, "❌ Пример: `/setautothreshold 0.5`")
+
     else:
         await send_tg(session,
             "/start /verify /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
@@ -2292,6 +2464,84 @@ async def scan_loop(session):
         await asyncio.sleep(config["scan_interval"])
 
 
+def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
+    """Готовая карточка с разбором — то же самое, что мы вручную собирали
+    сегодня по ONE/XTZ: цены, чистый спред, тренд, историческая
+    статистика именно на этом узком маршруте, и явная рекомендация."""
+    buy_ex, sell_ex, symbol = check["buy_ex"], check["sell_ex"], check["symbol"]
+    net_pct = check["net_pct"]
+
+    trades = route_hist.get("trades", 0)
+    profit = route_hist.get("profit_usdt", 0.0)
+    history_line = (
+        f"📜 История на этом маршруте: {trades} сделок, P&L {round(profit,3)} USDT"
+        if trades > 0 else
+        "📜 История на этом маршруте: ещё не исполнялась ни разу"
+    )
+
+    if "сужается" in trend:
+        verdict = "⚠️ Окно, похоже, уже закрывается — вряд ли стоит спешить."
+    elif "расширяется" in trend:
+        verdict = "👀 Разрыв растёт — стоит последить ещё немного, прежде чем доверять."
+    else:
+        verdict = "🤔 Пока недостаточно истории, чтобы судить об устойчивости."
+
+    return (
+        f"🤖 *АВТО-АНАЛИЗ: {buy_ex} → {sell_ex} | {symbol}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📥 Купить на {buy_ex}: `{check['buy_price']}`\n"
+        f"📤 Продать на {sell_ex}: `{check['sell_price']}`\n\n"
+        f"📊 Спред: `{check['gross_pct']}%` | После комиссий: `{net_pct}%`\n"
+        f"📈 Тренд за окно: {trend}\n\n"
+        f"{history_line}\n\n"
+        f"{verdict}\n"
+        f"_Это НЕ гарантия — только честный узкий расчёт (walk-the-book, "
+        f"именно между этими двумя биржами, без шума третьих). Перед "
+        f"реальным решением всё равно смотри `/verify {symbol}` и своей "
+        f"головой._\n\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+
+async def auto_signal_loop(session):
+    """НОВОЕ: фоновый автоматический разбор — раз в config['auto_check_
+    interval_sec'] проверяет всех кандидатов, засветившихся на целевых
+    маршрутах (TARGET_ROUTES), честным узким расчётом (не полагаясь на
+    зашумлённый общий /verify), копит историю спреда для тренда, и
+    присылает карточку только если спред выше config['auto_signal_min_pct']
+    и прошёл проверку глубины — с кулдауном, чтобы не спамить."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            for route_key in list(TARGET_ROUTES):
+                buy_ex, sell_ex = route_key
+                candidates = list(auto_route_candidates.get(route_key, set()))[:20]
+                for symbol in candidates:
+                    check = await check_narrow_route(session, buy_ex, sell_ex, symbol, config["lot_usdt"])
+                    if not check:
+                        continue
+                    record_route_spread(buy_ex, sell_ex, symbol, check["net_pct"])
+                    if check["net_pct"] < config["auto_signal_min_pct"]:
+                        continue
+
+                    cd_key = (buy_ex, sell_ex, symbol)
+                    now_ts = time.time()
+                    if now_ts - _last_auto_signal_time.get(cd_key, 0) < AUTO_SIGNAL_COOLDOWN_SEC:
+                        continue
+                    _last_auto_signal_time[cd_key] = now_ts
+
+                    trend = get_route_spread_trend(buy_ex, sell_ex, symbol)
+                    route_hist = route_coin_stats.get((buy_ex, sell_ex, symbol),
+                                                        {"trades": 0, "profit_usdt": 0.0})
+                    if CHAT_ID:
+                        await send_tg(session, format_auto_signal(check, trend, route_hist))
+                    await asyncio.sleep(0.7)
+        except Exception as e:
+            stats["errors"] += 1
+            logger.error(f"Auto signal loop error: {e}")
+        await asyncio.sleep(config["auto_check_interval_sec"])
+
+
 async def main():
     if not TG_TOKEN:
         logger.error("ARB_BOT_TOKEN не установлен!")
@@ -2310,9 +2560,10 @@ async def main():
             grid_loop(session),
             funding_loop(session),
             daily_digest_loop(session),
+            auto_signal_loop(session),
             return_exceptions=True,
         )
-        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop", "daily_digest_loop"]
+        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop", "daily_digest_loop", "auto_signal_loop"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
                 logger.error(f"Фоновая задача {name} упала с исключением: {result}")
