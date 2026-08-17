@@ -2380,8 +2380,43 @@ async def handle_command(session, text, chat_id):
             f"`/setautothreshold N` — порог чистого спреда, %\n\n"
             f"Как только кандидат на отслеживаемом маршруте покажет чистый "
             f"спред выше порога (и НЕ аномальный) — прилетит карточка с "
-            f"разбором и трендом автоматически, без ручных проверок."
+            f"разбором и трендом автоматически, без ручных проверок.\n\n"
+            f"`/routetrend МОНЕТА` — посмотреть накопленную историю спреда "
+            f"и тренд ПРЯМО СЕЙЧАС, не дожидаясь новой карточки."
         )
+
+    elif cmd == "/routetrend":
+        # НОВОЕ: история спреда копится в фоне на КАЖДОЙ автопроверке
+        # (раз в config['auto_check_interval_sec']), даже если карточка не
+        # отправлялась (спред ниже порога или ещё нет 2 точек). Раньше
+        # тренд можно было увидеть только внутри уже пришедшей карточки —
+        # теперь можно посмотреть накопленную историю в любой момент, не
+        # дожидаясь новой карточки (полезно сразу после первого появления
+        # монеты, чтобы не ждать вслепую).
+        if len(parts) < 2:
+            await send_tg(session, "Пример: `/routetrend LRC`")
+            return
+        symbol = parts[1].upper()
+        found_any = False
+        msg = f"📈 *ИСТОРИЯ СПРЕДА — {symbol}*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for buy_ex, sell_ex in TARGET_ROUTES:
+            hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol))
+            if not hist:
+                continue
+            found_any = True
+            trend = get_route_spread_trend(buy_ex, sell_ex, symbol)
+            points_str = " → ".join(f"{pct:+.2f}%" for _, pct in hist[-8:])
+            msg += (
+                f"*{buy_ex} → {sell_ex}*\n"
+                f"   Точек в окне (20 мин): {len(hist)}\n"
+                f"   Последние: {points_str}\n"
+                f"   Тренд: {trend}\n\n"
+            )
+        if not found_any:
+            msg += ("Пока нет накопленной истории — либо монета ещё не "
+                    "появлялась как кандидат на отслеживаемых маршрутах, "
+                    "либо прошло меньше минуты с первого появления.")
+        await send_tg(session, msg)
 
     elif cmd == "/addautoroute":
         if len(parts) < 3:
