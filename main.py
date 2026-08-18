@@ -125,7 +125,22 @@ AUTO_SIGNAL_COOLDOWN_SEC = 300              # не спамить по одно�
 # а не только показывала цифры. TrialArbBot и WorkerArbBot — разные
 # процессы без общей памяти, поэтому это значение нужно обновлять вручную
 # командой /setrealcoin при каждой смене монеты в рабочем боте.
-config["current_real_coin"] = "RVN"
+config["current_real_coin"] = "ONE"
+
+# НОВОЕ (по прямому запросу пользователя, 18.08): реальный, честный порог
+# входа в WorkerArbBot сейчас 4.0633% (комиссии + ребаланс + буфер эрозии
+# исполнения, откалиброванный по фактическим потерям 17-18.08) — заметно
+# выше старого порога автосигнала (0.3%). Раньше карточка автоанализа
+# срабатывала на ЛЮБОМ правдоподобном спреде — теперь отдельно отмечаем
+# и ЛОГИРУЕМ именно те сигналы, что реально прошли бы боевой порог
+# WorkerArbBot, а не просто "не аномальные". Обновляй вручную при каждом
+# изменении честного порога в рабочем боте (боты не делятся памятью).
+config["worker_honest_threshold_pct"] = 4.0633
+
+# Лог сигналов, которые прошли БОЕВОЙ порог WorkerArbBot — не только
+# "правдоподобных", а именно тех, что реально годятся для входа.
+qualified_signals_log: List[dict] = []
+QUALIFIED_SIGNALS_LOG_MAXLEN = 50
 
 # Кандидаты, которые недавно засветились сигналом на целевом маршруте —
 # наполняется внутри scan_cycle(), НЕЗАВИСИМО от того, прошёл ли сигнал
@@ -2595,6 +2610,50 @@ async def handle_command(session, text, chat_id):
         config["current_real_coin"] = parts[1].upper()
         await send_tg(session, f"✅ Текущая монета WorkerArbBot: {config['current_real_coin']}")
 
+    elif cmd == "/setworkerthreshold":
+        # НОВОЕ (18.08): синхронизация с БОЕВЫМ честным порогом WorkerArbBot
+        # (там он виден в /stats → «Порог... честный»). Обновляй здесь при
+        # каждом изменении — боты не делятся памятью.
+        if len(parts) < 2:
+            cur = config.get("worker_honest_threshold_pct", 4.0)
+            await send_tg(session,
+                f"Текущий боевой порог WorkerArbBot (по данным TrialArbBot): {cur}%\n\n"
+                f"Сигналы выше этого порога отдельно помечаются 🎯 и логируются "
+                f"в `/qualifiedsignals` — это не просто «правдоподобные», а "
+                f"реально проходные для рабочего бота.\n\n"
+                f"Сверься с настоящим значением в WorkerArbBot (`/stats` → "
+                f"«честный» порог) и обнови здесь при изменении.\n\n"
+                f"Пример: `/setworkerthreshold 4.06`"
+            )
+            return
+        try:
+            val = float(parts[1])
+            config["worker_honest_threshold_pct"] = val
+            await send_tg(session, f"✅ Боевой порог WorkerArbBot: {val}%")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/setworkerthreshold 4.06`")
+
+    elif cmd == "/qualifiedsignals":
+        # НОВОЕ (18.08): лог сигналов, реально прошедших боевой порог
+        # WorkerArbBot — не общая статистика сигналов, а именно те
+        # моменты, когда была настоящая, проходная возможность.
+        if not qualified_signals_log:
+            await send_tg(session,
+                f"Пока ни одного сигнала не прошло боевой порог "
+                f"({config.get('worker_honest_threshold_pct', 4.0)}%). "
+                f"Это ожидаемо — порог высокий и специально откалиброван "
+                f"так, чтобы редко, но надёжно.")
+            return
+        msg = (f"🎯 *СИГНАЛЫ, ПРОШЕДШИЕ БОЕВОЙ ПОРОГ* "
+               f"({config.get('worker_honest_threshold_pct', 4.0)}%)\n"
+               f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+        for entry in qualified_signals_log[-20:][::-1]:
+            msg += (f"{entry['time']} — *{entry['symbol']}* "
+                    f"{entry['buy_ex']}→{entry['sell_ex']}: `{entry['net_pct']}%` "
+                    f"(вердикт: {entry['verdict']})\n")
+        msg += f"\n_Всего в истории: {len(qualified_signals_log)}_"
+        await send_tg(session, msg)
+
     else:
         await send_tg(session,
             "/start /verify /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
@@ -2774,11 +2833,31 @@ async def auto_signal_loop(session):
                     if CHAT_ID:
                         card_text = format_auto_signal(check, trend, route_hist)
                         verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
+
+                        # НОВОЕ (18.08): отдельно отмечаем и логируем сигналы,
+                        # которые реально прошли бы БОЕВОЙ порог WorkerArbBot
+                        # (не просто "не аномальный", а фактически проходной).
+                        qualifies_real = check["net_pct"] >= config.get("worker_honest_threshold_pct", 4.0)
+                        if qualifies_real:
+                            qualified_signals_log.append({
+                                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "buy_ex": buy_ex, "sell_ex": sell_ex, "symbol": symbol,
+                                "net_pct": check["net_pct"], "verdict": verdict_obj["level"],
+                            })
+                            if len(qualified_signals_log) > QUALIFIED_SIGNALS_LOG_MAXLEN:
+                                qualified_signals_log.pop(0)
+                            card_text = (
+                                f"🎯 *ПРЕВЫШАЕТ БОЕВОЙ ПОРОГ WorkerArbBot "
+                                f"({config.get('worker_honest_threshold_pct', 4.0)}%)!*\n\n" + card_text
+                            )
+
                         # НОВОЕ: закрепляем только по-настоящему многообещающие
                         # (зелёный вердикт) карточки — чтобы не потерялись среди
                         # обычного потока сигналов сканера. Красные/жёлтые идут
-                        # обычным сообщением, без закрепления.
-                        if verdict_obj["level"] == "green":
+                        # обычным сообщением, без закрепления. Прошедшие боевой
+                        # порог закрепляем ВСЕГДА, даже если вердикт ещё не зелёный
+                        # (мало истории) — это самостоятельно значимая находка.
+                        if verdict_obj["level"] == "green" or qualifies_real:
                             await send_tg_pinned(session, card_text)
                         else:
                             await send_tg(session, card_text)
