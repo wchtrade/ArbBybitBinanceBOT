@@ -1796,8 +1796,21 @@ async def handle_command(session, text, chat_id):
                 msg += (f"   *{sym}*: ставка `{rate:.4f}%`/8ч, накоплено "
                         f"`{round(pos['accrued_usdt'],4)} USDT` за {pos['checks']} проверок\n")
 
-        msg += (f"\n_Подробности по каждому пункту: /stats, /triangle, /gridstats, "
-                f"/fundingstats — эта сводка их не заменяет, только даёт быстрый обзор._")
+        # --- 5. Автоанализ и боевой порог WorkerArbBot ---
+        threshold = config.get('worker_honest_threshold_pct', 4.0)
+        routes_str = ", ".join(f"{b}→{s}" for b, s in TARGET_ROUTES) or "(пусто)"
+        suspicious_count = stats.get("auto_signal_suspicious_skipped", 0)
+        msg += (
+            f"\n\n*5️⃣ Автоанализ узкого маршрута*\n"
+            f"   Маршруты: {routes_str} | Текущая монета WorkerArbBot: "
+            f"*{config.get('current_real_coin', '?')}*\n"
+            f"   Боевой порог: *{threshold}%* | Отсеяно как аномалия: {suspicious_count}\n"
+            f"   🎯 Сигналов прошло боевой порог: {len(qualified_signals_log)} "
+            f"| `/qualifiedsignals` — посмотреть список\n"
+        )
+
+        msg += (f"\n\n_Подробности по каждому пункту: /stats, /triangle, /gridstats, "
+                f"/fundingstats, /qualifiedsignals — эта сводка их не заменяет, только даёт быстрый обзор._")
         await send_tg(session, msg)
 
     elif cmd == "/fundinghistory":
