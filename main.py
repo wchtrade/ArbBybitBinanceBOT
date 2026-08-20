@@ -708,21 +708,19 @@ ALL_EXCHANGES = ["Binance", "KuCoin", "MEXC"]
 # DEX-ценой в сети BSC (самая распространённая и дешёвая по газу сеть
 # для TrustWallet-свопов).
 #
-# ВАЖНО: 1inch API с 2023 требует регистрацию и API-ключ — не подходит
-# для быстрой проверки без настройки. Вместо него используем публичный
-# API PancakeSwap (api.pancakeswap.info) — исторически работал БЕЗ
-# ключа, но точной гарантии, что он ещё жив в 2026, нет (последняя
-# подтверждённая активность в открытых источниках — 2022 год). Если
-# эндпоинт не отвечает — команда честно скажет об этом, а не соврёт
-# цифрой.
+# ИСПРАВЛЕНО 20.08: изначально использовался публичный API PancakeSwap
+# (api.pancakeswap.info) — оказался МЁРТВЫМ (HTTP 500 подтверждено по
+# логам Railway). Заменён на GeckoTerminal API (тот же холдинг, что и
+# CoinGecko) — актуальный, активно поддерживаемый на 2025-2026,
+# официально бесплатный без ключа, покрывает 250+ сетей включая BSC.
 #
-# ОГРАНИЧЕНИЕ: это цена на PancakeSwap ПО ДАННЫМ ПУЛА (после текущих
-# резервов), БЕЗ учёта газа сети и БЕЗ учёта price impact именно вашей
-# суммы — то есть ориентировочная, не точная котировка свопа. Реальный
-# своп через TrustWallet может отличаться. Адреса контрактов ниже —
-# только хорошо известные, официально подтверждённые токены; для новых
-# монет адрес нужно проверять вручную на bscscan.com, ошибка в адресе
-# даст мусорные данные без предупреждения от самого API.
+# ОГРАНИЧЕНИЕ: это цена ПО ДАННЫМ ЛУЧШЕГО ПУЛА (после текущих резервов),
+# БЕЗ учёта газа сети и БЕЗ учёта price impact именно вашей суммы — то
+# есть ориентировочная, не точная котировка свопа. Реальный своп через
+# TrustWallet может отличаться. Адреса контрактов ниже — только хорошо
+# известные, официально подтверждённые токены; для новых монет адрес
+# нужно проверять вручную на bscscan.com, ошибка в адресе даст мусорные
+# данные без явного предупреждения от самого API.
 # ═══════════════════════════════════════════════════════════════
 BSC_TOKEN_ADDRESSES = {
     "USDT": "0x55d398326f99059fF775485246999027B3197955",
@@ -731,34 +729,39 @@ BSC_TOKEN_ADDRESSES = {
     "USDC": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     "CAKE": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82",
 }
-_pancakeswap_price_cache: Dict[str, Tuple[float, float]] = {}  # address -> (ts, price_usd)
-PANCAKESWAP_CACHE_TTL_SEC = 30
+_dex_price_cache: Dict[str, Tuple[float, float]] = {}  # address -> (ts, price_usd)
+DEX_PRICE_CACHE_TTL_SEC = 30
 
 
 async def get_pancakeswap_price_usd(session, token_address: str) -> Optional[float]:
-    """Цена токена в USD по данным пула PancakeSwap (BSC). Возвращает
-    None при ЛЮБОЙ ошибке или неожиданном формате — никогда не гадает.
-    Кэш на 30 сек, чтобы не дёргать API на каждый вызов подряд."""
+    """Цена токена в USD через GeckoTerminal API (сеть BSC). Название
+    функции сохранено для обратной совместимости — реально теперь
+    использует GeckoTerminal, не мёртвый api.pancakeswap.info.
+    Возвращает None при ЛЮБОЙ ошибке или неожиданном формате — никогда
+    не гадает. Кэш на 30 сек, чтобы не дёргать API на каждый вызов подряд."""
     now = time.time()
-    cached = _pancakeswap_price_cache.get(token_address)
-    if cached and now - cached[0] < PANCAKESWAP_CACHE_TTL_SEC:
+    cached = _dex_price_cache.get(token_address)
+    if cached and now - cached[0] < DEX_PRICE_CACHE_TTL_SEC:
         return cached[1]
-    url = f"https://api.pancakeswap.info/api/v2/tokens/{token_address}"
+    url = f"https://api.geckoterminal.com/api/v2/simple/networks/bsc/token_price/{token_address}"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.get(url, headers={"accept": "application/json"},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
-                logger.error(f"PancakeSwap price fetch HTTP {r.status} для {token_address}")
+                logger.error(f"GeckoTerminal price fetch HTTP {r.status} для {token_address}")
                 return None
             data = await r.json()
-            price_str = (data.get("data") or {}).get("price")
+            token_prices = (((data.get("data") or {}).get("attributes") or {}).get("token_prices") or {})
+            # GeckoTerminal возвращает ключи в нижнем регистре
+            price_str = token_prices.get(token_address.lower()) or token_prices.get(token_address)
             if price_str is None:
-                logger.error(f"PancakeSwap: поле 'price' не найдено в ответе для {token_address}: {data}")
+                logger.error(f"GeckoTerminal: цена не найдена в ответе для {token_address}: {data}")
                 return None
             price = float(price_str)
-            _pancakeswap_price_cache[token_address] = (now, price)
+            _dex_price_cache[token_address] = (now, price)
             return price
     except Exception as e:
-        logger.error(f"PancakeSwap price exception для {token_address}: {e}")
+        logger.error(f"GeckoTerminal price exception для {token_address}: {e}")
         return None
 
 
@@ -2596,19 +2599,23 @@ async def handle_command(session, text, chat_id):
             f"`/routetrend МОНЕТА` — посмотреть накопленную историю спреда "
             f"и тренд ПРЯМО СЕЙЧАС, не дожидаясь новой карточки.\n\n"
             f"`/dexprice МОНЕТА` — сравнить CEX-цену с реальной DEX-ценой "
-            f"на PancakeSwap (BSC), полезно перед любой схемой через "
-            f"TrustWallet/DEX-своп."
+            f"в сети BSC (через GeckoTerminal), полезно перед любой схемой "
+            f"через TrustWallet/DEX-своп."
         )
 
     elif cmd == "/dexprice":
         # НОВОЕ: честное сравнение CEX-цены (Binance/KuCoin/MEXC) с
-        # реальной DEX-ценой на PancakeSwap (BSC) — чтобы проверить схему
-        # "купить на бирже → перевести на TrustWallet → продать через
-        # DEX-своп" ДО того, как рисковать реальными деньгами.
+        # реальной DEX-ценой в сети BSC (через GeckoTerminal, лучший пул
+        # по ликвидности — обычно PancakeSwap, но не гарантированно) —
+        # чтобы проверить схему "купить на бирже → перевести на
+        # TrustWallet → продать через DEX-своп" ДО того, как рисковать
+        # реальными деньгами.
         if len(parts) < 2:
             known = ", ".join(BSC_TOKEN_ADDRESSES.keys())
             await send_tg(session,
-                f"Сравнивает CEX-цену с реальной DEX-ценой на PancakeSwap (BSC).\n\n"
+                f"Сравнивает CEX-цену с реальной DEX-ценой в сети BSC "
+                f"(через GeckoTerminal — берёт лучший по ликвидности пул, "
+                f"обычно PancakeSwap).\n\n"
                 f"Известные токены (проверенные адреса): {known}\n"
                 f"Для других монет нужно вручную найти и проверить BEP-20 адрес "
                 f"на bscscan.com — просто напишите: `/dexprice SYMBOL 0xАДРЕС`\n\n"
@@ -2631,14 +2638,14 @@ async def handle_command(session, text, chat_id):
             )
             return
 
-        await send_tg(session, f"🔍 Смотрю DEX-цену {symbol} на PancakeSwap (BSC) и сравниваю с биржами...")
+        await send_tg(session, f"🔍 Смотрю DEX-цену {symbol} в сети BSC (через GeckoTerminal) и сравниваю с биржами...")
         dex_price = await get_pancakeswap_price_usd(session, token_address)
         if dex_price is None:
             await send_tg(session,
-                f"🔴 Не удалось получить DEX-цену для {symbol}. Либо публичный API "
-                f"PancakeSwap сейчас недоступен/отключён (это старый эндпоинт, "
-                f"гарантий на 2026 год нет), либо адрес контракта неверный. "
-                f"Проверьте детали в логах Railway (поиск \"PancakeSwap\")."
+                f"🔴 Не удалось получить DEX-цену для {symbol}. Либо API "
+                f"GeckoTerminal сейчас недоступен, либо адрес контракта неверный, "
+                f"либо у токена нет достаточно ликвидного пула на BSC. "
+                f"Проверьте детали в логах Railway (поиск \"GeckoTerminal\")."
             )
             return
 
@@ -2660,8 +2667,8 @@ async def handle_command(session, text, chat_id):
                         f"прежде чем считать это реальной прибылью."
                     )
         await send_tg(session,
-            f"💱 *{symbol} — CEX vs DEX (PancakeSwap, BSC)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"DEX-цена (PancakeSwap): `{dex_price}` USD\n\n"
+            f"💱 *{symbol} — CEX vs DEX (BSC, через GeckoTerminal)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"DEX-цена: `{dex_price}` USD\n\n"
             f"{cex_line}"
         )
 
