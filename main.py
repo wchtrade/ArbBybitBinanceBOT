@@ -701,6 +701,66 @@ ORDERBOOK_FN = {
 # ненадёжные сигналы.
 ALL_EXCHANGES = ["Binance", "KuCoin", "MEXC"]
 
+# ═══════════════════════════════════════════════════════════════
+# НОВОЕ (по прямому запросу пользователя — проверить схему "купить на
+# бирже, перевести на TrustWallet, продать через DEX-своп" до того, как
+# вносить туда реальные деньги): честное сравнение CEX-цены с реальной
+# DEX-ценой в сети BSC (самая распространённая и дешёвая по газу сеть
+# для TrustWallet-свопов).
+#
+# ВАЖНО: 1inch API с 2023 требует регистрацию и API-ключ — не подходит
+# для быстрой проверки без настройки. Вместо него используем публичный
+# API PancakeSwap (api.pancakeswap.info) — исторически работал БЕЗ
+# ключа, но точной гарантии, что он ещё жив в 2026, нет (последняя
+# подтверждённая активность в открытых источниках — 2022 год). Если
+# эндпоинт не отвечает — команда честно скажет об этом, а не соврёт
+# цифрой.
+#
+# ОГРАНИЧЕНИЕ: это цена на PancakeSwap ПО ДАННЫМ ПУЛА (после текущих
+# резервов), БЕЗ учёта газа сети и БЕЗ учёта price impact именно вашей
+# суммы — то есть ориентировочная, не точная котировка свопа. Реальный
+# своп через TrustWallet может отличаться. Адреса контрактов ниже —
+# только хорошо известные, официально подтверждённые токены; для новых
+# монет адрес нужно проверять вручную на bscscan.com, ошибка в адресе
+# даст мусорные данные без предупреждения от самого API.
+# ═══════════════════════════════════════════════════════════════
+BSC_TOKEN_ADDRESSES = {
+    "USDT": "0x55d398326f99059fF775485246999027B3197955",
+    "WBNB": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    "BUSD": "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
+    "USDC": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+    "CAKE": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82",
+}
+_pancakeswap_price_cache: Dict[str, Tuple[float, float]] = {}  # address -> (ts, price_usd)
+PANCAKESWAP_CACHE_TTL_SEC = 30
+
+
+async def get_pancakeswap_price_usd(session, token_address: str) -> Optional[float]:
+    """Цена токена в USD по данным пула PancakeSwap (BSC). Возвращает
+    None при ЛЮБОЙ ошибке или неожиданном формате — никогда не гадает.
+    Кэш на 30 сек, чтобы не дёргать API на каждый вызов подряд."""
+    now = time.time()
+    cached = _pancakeswap_price_cache.get(token_address)
+    if cached and now - cached[0] < PANCAKESWAP_CACHE_TTL_SEC:
+        return cached[1]
+    url = f"https://api.pancakeswap.info/api/v2/tokens/{token_address}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                logger.error(f"PancakeSwap price fetch HTTP {r.status} для {token_address}")
+                return None
+            data = await r.json()
+            price_str = (data.get("data") or {}).get("price")
+            if price_str is None:
+                logger.error(f"PancakeSwap: поле 'price' не найдено в ответе для {token_address}: {data}")
+                return None
+            price = float(price_str)
+            _pancakeswap_price_cache[token_address] = (now, price)
+            return price
+    except Exception as e:
+        logger.error(f"PancakeSwap price exception для {token_address}: {e}")
+        return None
+
 
 def _walk_by_notional(levels: List[list], target_notional: float):
     remaining = target_notional
@@ -2534,10 +2594,78 @@ async def handle_command(session, text, chat_id):
             f"спред выше порога (и НЕ аномальный) — прилетит карточка с "
             f"разбором и трендом автоматически, без ручных проверок.\n\n"
             f"`/routetrend МОНЕТА` — посмотреть накопленную историю спреда "
-            f"и тренд ПРЯМО СЕЙЧАС, не дожидаясь новой карточки."
+            f"и тренд ПРЯМО СЕЙЧАС, не дожидаясь новой карточки.\n\n"
+            f"`/dexprice МОНЕТА` — сравнить CEX-цену с реальной DEX-ценой "
+            f"на PancakeSwap (BSC), полезно перед любой схемой через "
+            f"TrustWallet/DEX-своп."
         )
 
-    elif cmd == "/routetrend":
+    elif cmd == "/dexprice":
+        # НОВОЕ: честное сравнение CEX-цены (Binance/KuCoin/MEXC) с
+        # реальной DEX-ценой на PancakeSwap (BSC) — чтобы проверить схему
+        # "купить на бирже → перевести на TrustWallet → продать через
+        # DEX-своп" ДО того, как рисковать реальными деньгами.
+        if len(parts) < 2:
+            known = ", ".join(BSC_TOKEN_ADDRESSES.keys())
+            await send_tg(session,
+                f"Сравнивает CEX-цену с реальной DEX-ценой на PancakeSwap (BSC).\n\n"
+                f"Известные токены (проверенные адреса): {known}\n"
+                f"Для других монет нужно вручную найти и проверить BEP-20 адрес "
+                f"на bscscan.com — просто напишите: `/dexprice SYMBOL 0xАДРЕС`\n\n"
+                f"⚠️ Это ориентировочная цена ПУЛА, без учёта газа сети и "
+                f"проскальзывания именно вашей суммы — не точная копия "
+                f"реального свопа в TrustWallet.\n\n"
+                f"Пример: `/dexprice CAKE`"
+            )
+            return
+        symbol = parts[1].upper()
+        if len(parts) >= 3 and parts[2].startswith("0x"):
+            token_address = parts[2]
+        elif symbol in BSC_TOKEN_ADDRESSES:
+            token_address = BSC_TOKEN_ADDRESSES[symbol]
+        else:
+            await send_tg(session,
+                f"❌ Не знаю адрес контракта для {symbol} на BSC. "
+                f"Найдите и проверьте адрес на bscscan.com, затем: "
+                f"`/dexprice {symbol} 0xАДРЕС`"
+            )
+            return
+
+        await send_tg(session, f"🔍 Смотрю DEX-цену {symbol} на PancakeSwap (BSC) и сравниваю с биржами...")
+        dex_price = await get_pancakeswap_price_usd(session, token_address)
+        if dex_price is None:
+            await send_tg(session,
+                f"🔴 Не удалось получить DEX-цену для {symbol}. Либо публичный API "
+                f"PancakeSwap сейчас недоступен/отключён (это старый эндпоинт, "
+                f"гарантий на 2026 год нет), либо адрес контракта неверный. "
+                f"Проверьте детали в логах Railway (поиск \"PancakeSwap\")."
+            )
+            return
+
+        # Сверяем с лучшей CEX-ценой, если монета есть в основном списке скрининга
+        cex_line = "_(монета не в списке CEX-скрининга — сравнение только с DEX-ценой)_"
+        if symbol in SYMBOLS:
+            all_data, active = await fetch_all(session)
+            usdt_data = all_data.get((symbol, "USDT"), {})
+            if usdt_data:
+                bids = [d["bid"] for d in usdt_data.values() if d.get("bid", 0) > 0]
+                if bids:
+                    best_cex_bid = max(bids)
+                    diff_pct = (dex_price - best_cex_bid) / best_cex_bid * 100
+                    cex_line = (
+                        f"Лучший CEX bid: `{best_cex_bid}` USDT\n"
+                        f"Разница DEX vs CEX: `{diff_pct:+.2f}%`\n\n"
+                        f"⚠️ Это БЕЗ учёта газа сети BSC (обычно $0.1-0.5) и БЕЗ "
+                        f"учёта комиссии биржи за покупку — вычтите их из разницы, "
+                        f"прежде чем считать это реальной прибылью."
+                    )
+        await send_tg(session,
+            f"💱 *{symbol} — CEX vs DEX (PancakeSwap, BSC)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"DEX-цена (PancakeSwap): `{dex_price}` USD\n\n"
+            f"{cex_line}"
+        )
+
+
         # НОВОЕ: история спреда копится в фоне на КАЖДОЙ автопроверке
         # (раз в config['auto_check_interval_sec']), даже если карточка не
         # отправлялась (спред ниже порога или ещё нет 2 точек). Раньше
