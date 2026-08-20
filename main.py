@@ -765,6 +765,66 @@ async def get_pancakeswap_price_usd(session, token_address: str) -> Optional[flo
         return None
 
 
+async def search_dex_pools(session, query: str, network: str = "bsc") -> Optional[List[dict]]:
+    """НОВОЕ (по прямому запросу пользователя): ищет ВСЕ пулы, подходящие
+    под запрос (обычно тикер), через GeckoTerminal /search/pools —
+    возвращает до 5 совпадений с ликвидностью каждого. НЕ выбирает
+    "правильный" вариант сама — на BSC любой может создать токен с ЛЮБЫМ
+    названием/тикером (token impersonation), поэтому решение, какой из
+    найденных пулов настоящий, должно оставаться за человеком. Реальный
+    проект почти всегда имеет ликвидность на порядки больше, чем
+    поддельный клон — это главный визуальный ориентир, но не гарантия,
+    сверяйте адрес и с независимым источником (bscscan.com, официальный
+    сайт проекта)."""
+    url = "https://api.geckoterminal.com/api/v2/search/pools"
+    params = {"query": query, "network": network, "include": "base_token,quote_token"}
+    try:
+        async with session.get(url, params=params, headers={"accept": "application/json"},
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                logger.error(f"GeckoTerminal search HTTP {r.status} для '{query}'")
+                return None
+            data = await r.json()
+            pools = data.get("data", [])
+            if not pools:
+                return []
+
+            # Строим карту адресов токенов из "included" (base_token/quote_token)
+            included = data.get("included", [])
+            token_map = {}  # id -> {"address":..., "symbol":...}
+            for item in included:
+                if item.get("type") == "token":
+                    attrs = item.get("attributes", {})
+                    token_map[item.get("id")] = {
+                        "address": attrs.get("address"),
+                        "symbol": attrs.get("symbol"),
+                    }
+
+            results = []
+            for pool in pools[:5]:
+                attrs = pool.get("attributes", {})
+                rel = pool.get("relationships", {})
+                base_id = ((rel.get("base_token") or {}).get("data") or {}).get("id")
+                base_token = token_map.get(base_id, {})
+                try:
+                    liquidity = float(attrs.get("reserve_in_usd") or 0)
+                except (TypeError, ValueError):
+                    liquidity = 0.0
+                results.append({
+                    "pool_name": attrs.get("name", "?"),
+                    "token_symbol": base_token.get("symbol", "?"),
+                    "token_address": base_token.get("address", "?"),
+                    "price_usd": attrs.get("base_token_price_usd"),
+                    "liquidity_usd": liquidity,
+                    "created_at": attrs.get("pool_created_at", "?"),
+                })
+            results.sort(key=lambda x: x["liquidity_usd"], reverse=True)
+            return results
+    except Exception as e:
+        logger.error(f"GeckoTerminal search exception для '{query}': {e}")
+        return None
+
+
 def _walk_by_notional(levels: List[list], target_notional: float):
     remaining = target_notional
     base_qty = 0.0
@@ -2598,12 +2658,66 @@ async def handle_command(session, text, chat_id):
             f"разбором и трендом автоматически, без ручных проверок.\n\n"
             f"`/routetrend МОНЕТА` — посмотреть накопленную историю спреда "
             f"и тренд ПРЯМО СЕЙЧАС, не дожидаясь новой карточки.\n\n"
+            f"`/dexsearch МОНЕТА` — найти ВСЕ пулы в BSC по названию, "
+            f"с ликвидностью каждого (защита от поддельных токенов).\n\n"
             f"`/dexprice МОНЕТА` — сравнить CEX-цену с реальной DEX-ценой "
             f"в сети BSC (через GeckoTerminal), полезно перед любой схемой "
             f"через TrustWallet/DEX-своп."
         )
 
-    elif cmd == "/dexprice":
+    elif cmd == "/dexsearch":
+        # НОВОЕ (по прямому запросу пользователя "можем ли давать цену
+        # ЛЮБОЙ монеты автоматически"): вместо того чтобы молча выбирать
+        # "правильный" адрес самостоятельно — показывает ВСЕ найденные
+        # варианты с их ликвидностью. КРИТИЧНО: на BSC любой может создать
+        # токен с ЛЮБЫМ тикером/названием (token impersonation) — сегодня
+        # мы уже видели, что даже официальный мостовой токен ONE может
+        # быть почти неликвидным (99.65% расхождение с биржей). Автовыбор
+        # первого результата был бы небезопасен — решение остаётся за
+        # человеком, бот только помогает увидеть все варианты сразу.
+        if len(parts) < 2:
+            await send_tg(session,
+                "Ищет ВСЕ пулы в сети BSC, подходящие под запрос (обычно тикер) "
+                "— показывает ликвидность каждого, чтобы отличить настоящий "
+                "проект от подделки с тем же названием.\n\n"
+                "⚠️ НИКОГДА не доверяй результату с первого взгляда — сверяй "
+                "адрес с официальным сайтом проекта или bscscan.com перед "
+                "любым реальным переводом.\n\n"
+                "Пример: `/dexsearch CAKE`"
+            )
+            return
+        query = " ".join(parts[1:])
+        await send_tg(session, f"🔍 Ищу пулы '{query}' в сети BSC...")
+        results = await search_dex_pools(session, query, "bsc")
+        if results is None:
+            await send_tg(session,
+                "🔴 Не удалось выполнить поиск — GeckoTerminal сейчас недоступен. "
+                "Проверьте логи Railway (поиск \"GeckoTerminal search\")."
+            )
+            return
+        if not results:
+            await send_tg(session, f"Ничего не найдено по запросу '{query}' в сети BSC.")
+            return
+
+        msg = f"🔍 *НАЙДЕНО ПУЛОВ ДЛЯ '{query}' (BSC)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        for i, r in enumerate(results, 1):
+            liq = r["liquidity_usd"]
+            warn = "⚠️ ОЧЕНЬ низкая ликвидность — высокий риск подделки/мёртвого пула" if liq < 5000 else ""
+            msg += (
+                f"{i}. *{r['pool_name']}*\n"
+                f"   Токен: {r['token_symbol']} | Адрес: `{r['token_address']}`\n"
+                f"   Цена: `{r['price_usd']}` USD | Ликвидность пула: `${liq:,.0f}` {warn}\n\n"
+            )
+        msg += (
+            "⚠️ *Реальный проект обычно имеет ликвидность на порядки больше "
+            "поддельных клонов — но это ориентир, не гарантия.* Обязательно "
+            "сверьте выбранный адрес с bscscan.com или официальным сайтом "
+            "проекта, прежде чем использовать `/dexprice СИМВОЛ 0xАДРЕС` "
+            "или тем более переводить реальные деньги."
+        )
+        await send_tg(session, msg)
+
+
         # НОВОЕ: честное сравнение CEX-цены (Binance/KuCoin/MEXC) с
         # реальной DEX-ценой в сети BSC (через GeckoTerminal, лучший пул
         # по ликвидности — обычно PancakeSwap, но не гарантированно) —
