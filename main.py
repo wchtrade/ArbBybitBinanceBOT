@@ -135,7 +135,13 @@ config["current_real_coin"] = "ONE"
 # и ЛОГИРУЕМ именно те сигналы, что реально прошли бы боевой порог
 # WorkerArbBot, а не просто "не аномальные". Обновляй вручную при каждом
 # изменении честного порога в рабочем боте (боты не делятся памятью).
-config["worker_honest_threshold_pct"] = 4.0633
+config["worker_honest_threshold_pct"] = 6.3078  # ОБНОВЛЕНО 21.08: было 4.0633,
+    # WorkerArbBot сам поднял честный порог после нескольких факт-минусовых
+    # сделок (буфер эрозии исполнения). Раньше это значение не обновлялось —
+    # /qualifiedsignals показывал устаревшие "проходные" сигналы (RVN на
+    # 4.06-4.84%), которые реальный бот на самом деле бы уже отклонил.
+    # Обновляй здесь при каждом изменении честного порога в WorkerArbBot
+    # (`/stats` → «честный»).
 
 # Лог сигналов, которые прошли БОЕВОЙ порог WorkerArbBot — не только
 # "правдоподобных", а именно тех, что реально годятся для входа.
@@ -2406,9 +2412,22 @@ async def handle_command(session, text, chat_id):
                "сигналов — но перед добавлением в реальную торговлю каждого прогони через /verify)\n"
                "━━━━━━━━━━━━━━━━━━━━━━\n\n")
         for i, (sym, cs) in enumerate(ranked, 1):
+            # ИСПРАВЛЕНО 21.08: при фильтре по маршруту цифры ДОЛЖНЫ быть
+            # именно по этому маршруту (route_coin_stats), а не глобальные
+            # (coin_stats) — иначе получается тот самый баг, из-за которого
+            # RVN показывала 579 сделок/$1408 P&L в "/leaderboard KuCoin
+            # MEXC", хотя реально на этом маршруте было в разы меньше
+            # (сравни с честной /routecoins KuCoin MEXC, которую чинили
+            # ещё 17.08 — тут был тот же класс ошибки, просто в другой
+            # команде, упущенной тогда).
+            if route_filter is not None:
+                display_stats = route_coin_stats.get((parts[1], parts[2], sym),
+                                                        {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
+            else:
+                display_stats = cs
             msg += (
-                f"{i}. *{sym}* — сигналов: `{cs['signals']}` | сделок: `{cs['trades']}` | "
-                f"P&L: `{round(cs['profit_usdt'],3)} USDT` | лучшая маржа: `{cs['best_net_pct']}%`\n"
+                f"{i}. *{sym}* — сигналов: `{display_stats['signals']}` | сделок: `{display_stats['trades']}` | "
+                f"P&L: `{round(display_stats['profit_usdt'],3)} USDT` | лучшая маржа: `{display_stats['best_net_pct']}%`\n"
             )
         if route_filter is None:
             msg += "\n_Через какую именно валюту (USDT/BTC/ETH) — смотри /pairs. Фильтр по маршруту: `/leaderboard БИРЖА1 БИРЖА2`_"
@@ -2718,6 +2737,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
 
+    elif cmd == "/dexprice":
         # НОВОЕ: честное сравнение CEX-цены (Binance/KuCoin/MEXC) с
         # реальной DEX-ценой в сети BSC (через GeckoTerminal, лучший пул
         # по ликвидности — обычно PancakeSwap, но не гарантированно) —
@@ -2787,6 +2807,7 @@ async def handle_command(session, text, chat_id):
         )
 
 
+    elif cmd == "/routetrend":
         # НОВОЕ: история спреда копится в фоне на КАЖДОЙ автопроверке
         # (раз в config['auto_check_interval_sec']), даже если карточка не
         # отправлялась (спред ниже порога или ещё нет 2 точек). Раньше
