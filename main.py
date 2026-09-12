@@ -2849,18 +2849,21 @@ async def main():
     )
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # ИЗМЕНЕНО (по прямому запросу пользователя — "должны быть только
+        # треугольник и только KuCoin/MEXC"): scan_loop (старый межбиржевой
+        # арбитраж, включающий Binance, отправлявший карточки вида "KuCoin
+        # → Binance") убран из фонового запуска. Функция scan_loop и весь
+        # код классического арбитража остаются в файле нетронутыми — можно
+        # вернуть, добавив scan_loop(session) обратно в список ниже.
         results = await asyncio.gather(
             polling_loop(session),
-            scan_loop(session),
             grid_loop(session),
             funding_loop(session),
             daily_digest_loop(session),
-            auto_signal_loop(session),
             triangle_scan_loop(session),
             return_exceptions=True,
         )
-        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop", "daily_digest_loop",
-                  "auto_signal_loop", "triangle_scan_loop"]
+        names = ["polling_loop", "grid_loop", "funding_loop", "daily_digest_loop", "triangle_scan_loop"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
                 logger.error(f"Фоновая задача {name} упала с исключением: {result}")
