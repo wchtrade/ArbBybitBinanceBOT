@@ -61,11 +61,6 @@ coin_stats: Dict[str, dict] = {
 }
 pair_stats: Dict[tuple, dict] = {}
 route_stats: Dict[tuple, dict] = {}
-# НОВОЕ (17.08): раньше /routecoins показывал числа из ГЛОБАЛЬНОЙ
-# coin_stats[symbol] — те же самые для любого маршрута, где монета вообще
-# встречалась (баг, обнаруженный на практике: RVN и ONE показывали
-# ОДИНАКОВЫЕ "лучшая маржа" на двух разных парах бирж). Эта структура
-# считает статистику по каждой (buy_ex, sell_ex, symbol) отдельно.
 route_coin_stats: Dict[Tuple[str, str, str], dict] = {}
 currency_balances: Dict[str, float] = {q: 0.0 for q in QUOTE_CURRENCIES if q != "USDT"}
 conversions_log: List[dict] = []
@@ -81,81 +76,26 @@ stats = {
 trade_history: List[dict] = []
 last_signal_time: Dict[str, float] = {}
 
-# НОВОЕ (17.08): почасовая статистика сигналов (UTC) — по запросу
-# пользователя, чтобы понять, есть ли часы суток с более активным рынком
-# на 4 верифицированных биржах, раз ~2 часа мониторинга не дали ни одной
-# правдоподобной возможности. Отдельно считаем ВСЕ сигналы и отдельно
-# ПРАВДОПОДОБНЫЕ (gross_pct < SUSPICIOUS_SPREAD_PCT) — иначе картина
-# исказится "аномальными" сигналами вроде HTX-артефактов.
 hourly_signals: Dict[int, int] = defaultdict(int)
 hourly_plausible_signals: Dict[int, int] = defaultdict(int)
-# НОВОЕ (доработка по запросу пользователя, 17.08): та же почасовая
-# статистика, но привязанная к конкретному маршруту биржа→биржа — общий
-# /hours размазывает картину по всем 12 маршрутам разом, а для решения
-# "когда включать WorkerArbBot" важна активность именно на его маршруте
-# (KuCoin→MEXC). Ключ: (час UTC, buy_ex, sell_ex).
 hourly_route_signals: Dict[Tuple[int, str, str], int] = defaultdict(int)
 hourly_route_plausible: Dict[Tuple[int, str, str], int] = defaultdict(int)
 
-# ═══════════════════════════════════════════════════════════════
-# НОВОЕ (доработка по запросу пользователя, 17.08): АВТОМАТИЧЕСКИЙ АНАЛИЗ
-# УЗКОГО МАРШРУТА — то, что мы весь вечер делали руками (/prices несколько
-# раз подряд, расчёт спреда именно между ДВУМЯ конкретными биржами, а не
-# всеми тремя как в /verify — там Binance регулярно "портил" картину
-# ложными срабатываниями). Теперь бот делает это сам, каждую минуту, по
-# каждому кандидату, который недавно засветился сигналом на целевом
-# маршруте, и присылает готовую карточку с разбором и трендом, только
-# когда есть что показать (а не спамит на каждый чих).
-#
-# TARGET_ROUTES — какие именно маршруты отслеживать. По умолчанию только
-# KuCoin→MEXC, потому что это единственный маршрут, который реально
-# использует WorkerArbBot (DEFAULT_PAIRS в его коде). Управляется через
-# /autoroutes, /addautoroute, /removeautoroute.
-# ═══════════════════════════════════════════════════════════════
 TARGET_ROUTES: List[Tuple[str, str]] = [("KuCoin", "MEXC")]
 
-config["auto_signal_min_pct"] = 0.3        # минимальный ЧИСТЫЙ (после комиссий) спред на
-                                             # узком маршруте, чтобы прислать карточку
-config["auto_check_interval_sec"] = 60      # как часто проверять кандидатов
-AUTO_SIGNAL_COOLDOWN_SEC = 300              # не спамить по одной и той же монете чаще, чем раз в 5 мин
+config["auto_signal_min_pct"] = 0.3
+config["auto_check_interval_sec"] = 60
+AUTO_SIGNAL_COOLDOWN_SEC = 300
 
-# НОВОЕ (по прямому запросу пользователя, 17.08): какая монета СЕЙЧАС
-# реально торгуется в WorkerArbBot — нужна, чтобы зелёная карточка сразу
-# формировала готовый блок команд (/addcoin НОВАЯ → /removecoin СТАРАЯ),
-# а не только показывала цифры. TrialArbBot и WorkerArbBot — разные
-# процессы без общей памяти, поэтому это значение нужно обновлять вручную
-# командой /setrealcoin при каждой смене монеты в рабочем боте.
 config["current_real_coin"] = "ONE"
 
-# НОВОЕ (по прямому запросу пользователя, 18.08): реальный, честный порог
-# входа в WorkerArbBot сейчас 4.0633% (комиссии + ребаланс + буфер эрозии
-# исполнения, откалиброванный по фактическим потерям 17-18.08) — заметно
-# выше старого порога автосигнала (0.3%). Раньше карточка автоанализа
-# срабатывала на ЛЮБОМ правдоподобном спреде — теперь отдельно отмечаем
-# и ЛОГИРУЕМ именно те сигналы, что реально прошли бы боевой порог
-# WorkerArbBot, а не просто "не аномальные". Обновляй вручную при каждом
-# изменении честного порога в рабочем боте (боты не делятся памятью).
-config["worker_honest_threshold_pct"] = 6.3078  # ОБНОВЛЕНО 21.08: было 4.0633,
-    # WorkerArbBot сам поднял честный порог после нескольких факт-минусовых
-    # сделок (буфер эрозии исполнения). Раньше это значение не обновлялось —
-    # /qualifiedsignals показывал устаревшие "проходные" сигналы (RVN на
-    # 4.06-4.84%), которые реальный бот на самом деле бы уже отклонил.
-    # Обновляй здесь при каждом изменении честного порога в WorkerArbBot
-    # (`/stats` → «честный»).
+config["worker_honest_threshold_pct"] = 6.3078
 
-# Лог сигналов, которые прошли БОЕВОЙ порог WorkerArbBot — не только
-# "правдоподобных", а именно тех, что реально годятся для входа.
 qualified_signals_log: List[dict] = []
 QUALIFIED_SIGNALS_LOG_MAXLEN = 50
 
-# Кандидаты, которые недавно засветились сигналом на целевом маршруте —
-# наполняется внутри scan_cycle(), НЕЗАВИСИМО от того, прошёл ли сигнал
-# фильтр "подозрительности" (5%) — узкий расчёт по двум биржам надёжнее.
 auto_route_candidates: Dict[Tuple[str, str], set] = defaultdict(set)
 
-# История чистого спреда по (buy_ex, sell_ex, symbol) — для тренда
-# (сужается/расширяется/стабилен), та же логика, что считали руками для
-# ONE и XTZ сегодня. Храним точки за последние 20 минут.
 route_symbol_spread_history: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = defaultdict(list)
 ROUTE_SPREAD_HISTORY_WINDOW_SEC = 20 * 60
 
@@ -164,10 +104,6 @@ _last_auto_signal_time: Dict[Tuple[str, str, str], float] = {}
 
 async def check_narrow_route(session, buy_ex: str, sell_ex: str, symbol: str,
                               lot_usdt: float) -> Optional[dict]:
-    """Честный расчёт спреда ИМЕННО между двумя конкретными биржами (не
-    всеми ALL_EXCHANGES разом, как /verify) — walk-the-book по реальной
-    глубине, с проверкой минимальной глубины на обеих сторонах. Это то,
-    что мы весь вечер считали руками по /prices — теперь автоматически."""
     if buy_ex not in ORDERBOOK_FN or sell_ex not in ORDERBOOK_FN:
         return None
     buy_book = await ORDERBOOK_FN[buy_ex](session, SYMBOL_FMT[buy_ex](symbol))
@@ -178,7 +114,7 @@ async def check_narrow_route(session, buy_ex: str, sell_ex: str, symbol: str,
             len(buy_book.get("bids", [])) < MIN_DEPTH_LEVELS or
             len(sell_book.get("asks", [])) < MIN_DEPTH_LEVELS or
             len(sell_book.get("bids", [])) < MIN_DEPTH_LEVELS):
-        return None  # тонкий стакан хотя бы на одной стороне — не доверяем
+        return None
 
     coins, avg_buy, _, buy_full = _walk_by_notional(buy_book["asks"], lot_usdt)
     if not buy_full or coins <= 0 or avg_buy <= 0:
@@ -194,12 +130,6 @@ async def check_narrow_route(session, buy_ex: str, sell_ex: str, symbol: str,
     net_pct = profit / lot_usdt * 100
     gross_pct = (avg_sell - avg_buy) / avg_buy * 100 if avg_buy > 0 else 0.0
 
-    # НОВОЕ: даже узкий двухбиржевой спред может быть аномалией — как
-    # выяснилось на практике 17.08 (RVN, MEXC устойчиво +15-17% выше
-    # остального рынка много часов подряд, при этом глубина стакана в
-    # порядке и walk-the-book честно проходит). Убирая общий 3-биржевой
-    # /verify-фильтр, мы потеряли и эту защиту — возвращаем её здесь,
-    # тем же порогом SUSPICIOUS_SPREAD_PCT, что и во всём остальном коде.
     is_suspicious = gross_pct >= SUSPICIOUS_SPREAD_PCT
 
     return {
@@ -225,9 +155,6 @@ def record_route_spread(buy_ex: str, sell_ex: str, symbol: str, net_pct: float) 
 
 
 def get_route_spread_trend(buy_ex: str, sell_ex: str, symbol: str) -> str:
-    """Сравнивает первую и последнюю точку в окне — тот же способ, каким
-    мы вручную сравнивали замеры /prices сегодня. Возвращает готовую
-    короткую подпись для карточки."""
     hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol))
     if not hist or len(hist) < 2:
         return "➡️ данных пока мало для тренда"
@@ -243,20 +170,6 @@ def get_route_spread_trend(buy_ex: str, sell_ex: str, symbol: str) -> str:
         return f"➡️ стабилен ({first_pct:+.2f}% → {last_pct:+.2f}% за {span_min} мин)"
 
 
-# НОВОЕ (по прямому запросу пользователя, 17.08 — "чтобы бот сам делал
-# заключение, а не только показывал цифры"): раньше финальный вердикт
-# ("это аномалия, не годится" / "это выглядит надёжно") каждый раз
-# формулировался вручную, глядя на цифры из чата — ИМЕННО ЭТОГО было
-# недостаточно в автоматизации. Теперь бот сам решает, основываясь на
-# ТОЙ ЖЕ логике, что применялась вручную сегодня к RVN/ONE/XTZ/LRC:
-#   - МОНОТОННЫЙ рост без единого отката, особенно если уже близко к
-#     порогу аномальности (5%) или уже за ним — прогрессирующая
-#     аномалия (паттерн LRC 17.08: 1.85→3.26→4.76→4.86→4.90→5.08%,
-#     ни одного отката).
-#   - Колебания в узком диапазоне БЕЗ устойчивого направления, спред
-#     стабильно положительный и заметно ниже порога аномальности —
-#     похоже на настоящее, ограниченное по амплитуде окно.
-#   - Иначе — рано судить, нужно больше истории.
 def get_route_spread_verdict(buy_ex: str, sell_ex: str, symbol: str) -> dict:
     hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol), [])
     if len(hist) < 3:
@@ -267,8 +180,6 @@ def get_route_spread_verdict(buy_ex: str, sell_ex: str, symbol: str) -> dict:
     values = [v for _, v in hist]
     last = values[-1]
 
-    # Монотонность: сравниваем каждую точку со следующей, допускаем
-    # микро-шум ±0.05 п.п. как "не откат".
     diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
     monotonic_up = all(d >= -0.05 for d in diffs) and sum(diffs) > 0.15
     monotonic_down = all(d <= 0.05 for d in diffs) and sum(diffs) < -0.15
@@ -301,15 +212,8 @@ def get_route_spread_verdict(buy_ex: str, sell_ex: str, symbol: str) -> dict:
                     "аномалии. Продолжаем наблюдать."}
 
 
-# ===== НОВОЕ (доработка по запросу пользователя, 17.08): отслеживание
-# волатильности по монете (USDT-пара), чтобы предупреждать в карточке
-# сигнала, если широкий спред может быть моментум-эффектом (котировки на
-# разных биржах обновляются с разной скоростью на быстро движущемся
-# рынке), а не устойчивой арбитражной возможностью. Обнаружено на
-# практике на RVN 17.08 — широкий "спред" во время сильного роста цены
-# дважды подряд закрылся в реальный минус в WorkerArbBot. =====
 price_history: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-PRICE_HISTORY_WINDOW_SEC = 15 * 60  # 15 минут
+PRICE_HISTORY_WINDOW_SEC = 15 * 60
 
 
 def record_symbol_price(symbol: str, mid_price: float) -> None:
@@ -324,8 +228,6 @@ def record_symbol_price(symbol: str, mid_price: float) -> None:
 
 
 def get_volatility_pct(symbol: str) -> Optional[float]:
-    """Максимальное движение цены (в любую сторону) за последние 15 минут.
-    None, если данных ещё недостаточно (символ только что появился)."""
     hist = price_history.get(symbol)
     if not hist or len(hist) < 2:
         return None
@@ -362,13 +264,6 @@ async def send_tg(session, text):
         return None
 
 
-# НОВОЕ (по прямому запросу пользователя, 17.08): закрепление важных
-# сигнальных карточек, чтобы они не терялись среди обычного потока
-# сигналов сканера — те продолжают идти как раньше, ничего не меняем в
-# их логике. Закрепляем ТОЛЬКО карточки автоанализа с зелёным вердиктом
-# (реально многообещающий кандидат) — иначе закреплений будет слишком
-# много и сам смысл потеряется. При появлении нового зелёного кандидата
-# старое закрепление снимается, остаётся только самое актуальное.
 _last_pinned_message_id: Optional[int] = None
 
 
@@ -401,9 +296,6 @@ async def unpin_message(session, message_id: int) -> None:
 
 
 async def send_tg_pinned(session, text: str) -> None:
-    """Отправляет сообщение и закрепляет его, предварительно открепив
-    предыдущее закреплённое авто-сообщение (если было) — чтобы в
-    закреплённых оставался только самый свежий, самый релевантный сигнал."""
     global _last_pinned_message_id
     message_id = await send_tg(session, text)
     if not message_id:
@@ -691,43 +583,18 @@ ORDERBOOK_FN = {
     "Bitget": get_orderbook_bitget, "MEXC": get_orderbook_mexc,
 }
 
-# ИЗМЕНЕНО (по запросу пользователя, 17.08, раунд 2): HTX убрана из
-# основного скана. Причина — три контрольных замера подряд (16:24, 16:25,
-# 16:41 по PYTH/USDT) показали АБСОЛЮТНО идентичную цену HTX (0.039888/
-# 0.039889) с точностью до последней цифры, при том что за это время
-# Binance/KuCoin/MEXC успевали заметно сдвинуться, а глубина стакана
-# вокруг этой "неподвижной" цены сама менялась (150/22 -> 150/21). Это
-# признак застрявшего/неживого тикера API HTX, а не реального затишья
-# рынка — реальная цена так себя не ведёт даже на низколиквидных монетах.
-# Ровно эта же биржа была источником всех "аномальных" (15-21%) сигналов
-# по RVN и ONE весь день 17.08. get_htx/get_orderbook_htx оставлены в
-# файле нетронутыми — HTX всё ещё доступна вручную через /prices
-# (SYMBOL_FMT и ORDERBOOK_FN её не теряют), просто исключена из
-# автоматического скана, чтобы не тратить внимание на заведомо
-# ненадёжные сигналы.
 ALL_EXCHANGES = ["Binance", "KuCoin", "MEXC"]
 
-# ═══════════════════════════════════════════════════════════════
-# НОВОЕ (по прямому запросу пользователя — проверить схему "купить на
-# бирже, перевести на TrustWallet, продать через DEX-своп" до того, как
-# вносить туда реальные деньги): честное сравнение CEX-цены с реальной
-# DEX-ценой в сети BSC (самая распространённая и дешёвая по газу сеть
-# для TrustWallet-свопов).
-#
-# ИСПРАВЛЕНО 20.08: изначально использовался публичный API PancakeSwap
-# (api.pancakeswap.info) — оказался МЁРТВЫМ (HTTP 500 подтверждено по
-# логам Railway). Заменён на GeckoTerminal API (тот же холдинг, что и
-# CoinGecko) — актуальный, активно поддерживаемый на 2025-2026,
-# официально бесплатный без ключа, покрывает 250+ сетей включая BSC.
-#
-# ОГРАНИЧЕНИЕ: это цена ПО ДАННЫМ ЛУЧШЕГО ПУЛА (после текущих резервов),
-# БЕЗ учёта газа сети и БЕЗ учёта price impact именно вашей суммы — то
-# есть ориентировочная, не точная котировка свопа. Реальный своп через
-# TrustWallet может отличаться. Адреса контрактов ниже — только хорошо
-# известные, официально подтверждённые токены; для новых монет адрес
-# нужно проверять вручную на bscscan.com, ошибка в адресе даст мусорные
-# данные без явного предупреждения от самого API.
-# ═══════════════════════════════════════════════════════════════
+# НОВОЕ (по прямому запросу пользователя — треугольник по ВСЕМ монетам
+# только на KuCoin и MEXC, без Binance): раньше треугольник использовал
+# отдельный, маленький список TRIANGLE_SYMBOLS (~12 монет) на ВСЕХ
+# биржах включая Binance (ALL_EXCHANGES). Теперь — полный список SYMBOLS
+# (~110 монет), только на этих двух биржах (Binance заблокирован по API
+# на территории пользователя, к тому же не нужен для этой конкретной
+# схемы — треугольник происходит внутри одной биржи, KuCoin/MEXC уже
+# используются в основной реальной торговле).
+TRIANGLE_EXCHANGES = ["KuCoin", "MEXC"]
+
 BSC_TOKEN_ADDRESSES = {
     "USDT": "0x55d398326f99059fF775485246999027B3197955",
     "WBNB": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
@@ -735,16 +602,11 @@ BSC_TOKEN_ADDRESSES = {
     "USDC": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     "CAKE": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82",
 }
-_dex_price_cache: Dict[str, Tuple[float, float]] = {}  # address -> (ts, price_usd)
+_dex_price_cache: Dict[str, Tuple[float, float]] = {}
 DEX_PRICE_CACHE_TTL_SEC = 30
 
 
 async def get_pancakeswap_price_usd(session, token_address: str) -> Optional[float]:
-    """Цена токена в USD через GeckoTerminal API (сеть BSC). Название
-    функции сохранено для обратной совместимости — реально теперь
-    использует GeckoTerminal, не мёртвый api.pancakeswap.info.
-    Возвращает None при ЛЮБОЙ ошибке или неожиданном формате — никогда
-    не гадает. Кэш на 30 сек, чтобы не дёргать API на каждый вызов подряд."""
     now = time.time()
     cached = _dex_price_cache.get(token_address)
     if cached and now - cached[0] < DEX_PRICE_CACHE_TTL_SEC:
@@ -758,7 +620,6 @@ async def get_pancakeswap_price_usd(session, token_address: str) -> Optional[flo
                 return None
             data = await r.json()
             token_prices = (((data.get("data") or {}).get("attributes") or {}).get("token_prices") or {})
-            # GeckoTerminal возвращает ключи в нижнем регистре
             price_str = token_prices.get(token_address.lower()) or token_prices.get(token_address)
             if price_str is None:
                 logger.error(f"GeckoTerminal: цена не найдена в ответе для {token_address}: {data}")
@@ -772,16 +633,6 @@ async def get_pancakeswap_price_usd(session, token_address: str) -> Optional[flo
 
 
 async def search_dex_pools(session, query: str, network: str = "bsc") -> Optional[List[dict]]:
-    """НОВОЕ (по прямому запросу пользователя): ищет ВСЕ пулы, подходящие
-    под запрос (обычно тикер), через GeckoTerminal /search/pools —
-    возвращает до 5 совпадений с ликвидностью каждого. НЕ выбирает
-    "правильный" вариант сама — на BSC любой может создать токен с ЛЮБЫМ
-    названием/тикером (token impersonation), поэтому решение, какой из
-    найденных пулов настоящий, должно оставаться за человеком. Реальный
-    проект почти всегда имеет ликвидность на порядки больше, чем
-    поддельный клон — это главный визуальный ориентир, но не гарантия,
-    сверяйте адрес и с независимым источником (bscscan.com, официальный
-    сайт проекта)."""
     url = "https://api.geckoterminal.com/api/v2/search/pools"
     params = {"query": query, "network": network, "include": "base_token,quote_token"}
     try:
@@ -795,9 +646,8 @@ async def search_dex_pools(session, query: str, network: str = "bsc") -> Optiona
             if not pools:
                 return []
 
-            # Строим карту адресов токенов из "included" (base_token/quote_token)
             included = data.get("included", [])
-            token_map = {}  # id -> {"address":..., "symbol":...}
+            token_map = {}
             for item in included:
                 if item.get("type") == "token":
                     attrs = item.get("attributes", {})
@@ -1036,10 +886,6 @@ def format_signal(opp: dict) -> str:
             f"Проверь `/verify {opp['symbol']}` прежде чем доверять этой цифре — команда явно "
             f"сверит и глубину стакана, и совпадение цены между биржами.\n"
         )
-    # НОВОЕ (доработка 17.08): волатильность за 15 минут — широкий спред на
-    # быстро движущейся монете часто означает, что котировки разных бирж
-    # просто по-разному успевают обновляться за рынком, а не устойчивую
-    # возможность. Не блокирует сигнал, только предупреждает.
     vol = get_volatility_pct(opp["symbol"])
     if vol is not None and vol >= 2.0:
         warning += (
@@ -1071,10 +917,6 @@ def format_signal(opp: dict) -> str:
 
 
 async def fetch_all(session):
-    # ИЗМЕНЕНО (17.08, раунд 2): HTX убрана из основного скана — см.
-    # комментарий у ALL_EXCHANGES (застрявший тикер, подтверждено 3
-    # замерами подряд). Порядок вызовов ДОЛЖЕН совпадать с порядком
-    # ALL_EXCHANGES, иначе результаты приклеятся не к тем биржам.
     results = await asyncio.gather(
         get_binance(session), get_kucoin(session), get_mexc(session),
         return_exceptions=True
@@ -1100,9 +942,6 @@ async def fetch_all(session):
 async def scan_cycle(session):
     stats["scans"] += 1
     all_data, active = await fetch_all(session)
-    # НОВОЕ: фиксируем среднюю цену (mid) по USDT-парам для отслеживания
-    # волатильности — используется в format_signal для предупреждения о
-    # моментум-эффекте (см. price_history выше).
     for (base, quote), exchanges in all_data.items():
         if quote != "USDT" or not exchanges:
             continue
@@ -1146,12 +985,6 @@ async def scan_cycle(session):
             if o["gross_pct"] < SUSPICIOUS_SPREAD_PCT:
                 hourly_route_plausible[hrk] += 1
 
-            # НОВОЕ: кандидат для автоматического анализа узкого маршрута —
-            # ДОБАВЛЯЕМ НЕЗАВИСИМО от фильтра "подозрительности". Мы на
-            # практике убедились сегодня, что общий /verify (все 3+ биржи
-            # разом) может ложно браковать монету из-за шума на бирже,
-            # которая вообще не участвует в целевом маршруте (Binance для
-            # KuCoin↔MEXC) — узкий двухбиржевой расчёт надёжнее.
             route_key = (o["buy_ex"], o["sell_ex"])
             if route_key in TARGET_ROUTES and o["quote"] == "USDT":
                 auto_route_candidates[route_key].add(o["symbol"])
@@ -1247,46 +1080,36 @@ async def execute_sim(opp: dict, session=None):
 
 
 # ═══════════════════════════════════════════════════════════════
-# НОВОЕ 11.08: ТРЕУГОЛЬНЫЙ АРБИТРАЖ — на КАЖДОЙ бирже отдельно (не между
-# биржами — треугольник в принципе внутри одной площадки, монета не может
-# телепортироваться между биржами бесплатно). Путь: USDT -> МОСТ (BTC) ->
-# АЛЬТ -> USDT, и обратное направление. Считаем по РЕАЛЬНОЙ глубине
-# стакана (walk-the-book), теми же проверенными функциями _walk_by_notional
-# и _walk_by_qty, что уже используются для честной проверки обычного
-# арбитража — не top-of-book, который может обмануть на тонком стакане.
+# ТРЕУГОЛЬНЫЙ АРБИТРАЖ — на КАЖДОЙ бирже отдельно.
 #
-# Список монет для треугольника — ОТДЕЛЬНЫЙ от SYMBOLS, чтобы не сканировать
-# все ~110 монет x 5 бирж x 3 стакана сразу (это было бы полторы тысячи
-# запросов за один /triangle — слишком медленно и рискует упереться в
-# рейт-лимиты). По умолчанию — ликвидные, крупные монеты, у которых
-# реально есть и ALT/BTC, и ALT/USDT пара почти на любой бирже.
+# ИЗМЕНЕНО (по прямому запросу пользователя — треугольник по ВСЕМ
+# монетам, а не отдельному маленькому списку): раньше здесь был отдельный
+# TRIANGLE_SYMBOLS (~12 монет специально отобранных как ликвидные). Такой
+# отдельный список больше не используется в сканировании — используется
+# полный SYMBOLS (~110 монет). Переменная оставлена только как алиас для
+# обратной совместимости (на случай, если где-то ещё используется имя).
 # ═══════════════════════════════════════════════════════════════
-TRIANGLE_SYMBOLS: List[str] = ["ETH", "BNB", "SOL", "XRP", "ADA", "DOGE",
-                                "LTC", "TRX", "DOT", "AVAX", "LINK", "TON"]
+TRIANGLE_SYMBOLS: List[str] = list(SYMBOLS)
 TRIANGLE_BRIDGE = "BTC"
 
 
 def fmt_pair(ex: str, base: str, quote: str) -> str:
-    """Обобщённый форматтер символа пары под конкретную биржу — то же
-    самое, что SYMBOL_FMT, но принимает ЛЮБУЮ котируемую валюту (не
-    только USDT), нужно для ноги ALT/BTC внутри треугольника."""
     if ex == "KuCoin":
         return f"{base}-{quote}"
     elif ex == "Gate":
         return f"{base}_{quote}"
     elif ex == "HTX":
         return f"{base.lower()}{quote.lower()}"
-    else:  # Binance, Bitget, MEXC — слитно, заглавными
+    else:
         return f"{base}{quote}"
 
 
 async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
                                      lot_usdt: float) -> List[dict]:
-    """Считает ОБА направления треугольника USDT<->BRIDGE<->ALT на ОДНОЙ
-    бирже, по реальной глубине стакана. Возвращает список найденных
-    возможностей (обычно 0, 1 или 2 — по одной на направление)."""
     ob_fn = ORDERBOOK_FN.get(ex)
     if not ob_fn:
+        return []
+    if alt == bridge or alt == "USDT":
         return []
 
     bridge_usdt_sym = fmt_pair(ex, bridge, "USDT")
@@ -1301,12 +1124,11 @@ async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
     )
     for b in (book_bridge_usdt, book_alt_bridge, book_alt_usdt):
         if isinstance(b, Exception) or not b or not b.get("bids") or not b.get("asks"):
-            return []  # хотя бы одной из трёх пар нет на этой бирже — треугольник не посчитать
+            return []
 
     fee = FEES.get(ex, 0.1) / 100
     found = []
 
-    # --- Путь 1: USDT -> BRIDGE -> ALT -> USDT ---
     bridge_qty, _, _, full1 = _walk_by_notional(book_bridge_usdt["asks"], lot_usdt)
     if full1 and bridge_qty > 0:
         bridge_after_fee = bridge_qty * (1 - fee)
@@ -1326,7 +1148,6 @@ async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
                         "levels": 3, "time": datetime.now().strftime("%H:%M:%S"),
                     })
 
-    # --- Путь 2: USDT -> ALT -> BRIDGE -> USDT (обратное направление) ---
     alt_qty2, _, _, full1b = _walk_by_notional(book_alt_usdt["asks"], lot_usdt)
     if full1b and alt_qty2 > 0:
         alt_after_fee2 = alt_qty2 * (1 - fee)
@@ -1350,12 +1171,21 @@ async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
 
 
 async def scan_all_triangles(session) -> List[dict]:
-    """Проверяет ВСЕ монеты из TRIANGLE_SYMBOLS на ВСЕХ биржах из
-    ALL_EXCHANGES разом — именно то, что попросили: полная картина по
-    всем площадкам одним запросом."""
+    """ИЗМЕНЕНО (по прямому запросу пользователя — треугольник по ВСЕМ
+    монетам, только KuCoin и MEXC): раньше проверялся маленький список
+    TRIANGLE_SYMBOLS (~12 монет) на ВСЕХ биржах включая Binance. Теперь —
+    полный список SYMBOLS (~110 монет), только на KuCoin и MEXC (Binance
+    заблокирован по API на территории пользователя, и не нужен для этой
+    схемы, работающей внутри одной биржи).
+
+    ВНИМАНИЕ: это ~660 запросов за один вызов (2 биржи × ~108 монет × 3
+    пары) — заметно больше, чем раньше (~70). Разумно для разовой,
+    ручной команды /triangle, но НЕ рекомендуется запускать это часто
+    в фоновом автоматическом цикле — риск упереться в ограничения
+    скорости запросов (rate limit) бирж."""
     tasks = []
-    for ex in ALL_EXCHANGES:
-        for alt in TRIANGLE_SYMBOLS:
+    for ex in TRIANGLE_EXCHANGES:
+        for alt in SYMBOLS:
             if alt == TRIANGLE_BRIDGE:
                 continue
             tasks.append(calc_triangle_on_exchange(session, ex, alt, TRIANGLE_BRIDGE, config["lot_usdt"]))
@@ -1369,25 +1199,11 @@ async def scan_all_triangles(session) -> List[dict]:
     return found
 
 
-# ══════════════════════════════════════════════════════════════
-# НОВОЕ 11.08: УЧЕБНЫЙ GRID-СИМУЛЯТОР — объединён в один бот с монитором
-# арбитража и треугольника (по вашему запросу, вместо отдельного третьего
-# бота). Та же гарантия безопасности: только симуляция на реальных ценах
-# Binance, физически не может отправить реальный ордер.
-#
-# Логика: диапазон цены [low, high], N уровней -> N-1 независимых ячеек
-# (купить на уровне i, продать на уровне i+1). После продажи ячейка сразу
-# "перевзводится" — снова готова купить, если цена опустится обратно.
-# ══════════════════════════════════════════════════════════════
-
-GRID_FEE_PCT = float(os.environ.get("GRID_FEE_PCT", "0.1"))  # Binance стандартная
+GRID_FEE_PCT = float(os.environ.get("GRID_FEE_PCT", "0.1"))
 grids: Dict[str, dict] = {}
 
 
 async def get_price_binance_simple(session, symbol: str) -> Optional[dict]:
-    """Best bid/ask — переиспользуем ту же логику, что и в остальном
-    файле, но без привязки к SYMBOLS (grid должен уметь взять ЛЮБОЙ
-    тикер, не только те 110+ монет из основного скрининга)."""
     try:
         async with session.get(f"{BINANCE_MARKET_BASE}/api/v3/ticker/bookTicker",
                                 params={"symbol": f"{symbol}USDT"},
@@ -1409,13 +1225,6 @@ def make_grid(symbol: str, low: float, high: float, levels: int, lot_usdt: float
     lines = [round(low + step * i, 8) for i in range(levels)]
     cells = []
     for i in range(levels - 1):
-        # ИСПРАВЛЕНИЕ 11.08: раньше "взвод" на покупку не учитывался — если
-        # цена стартовала НИЖЕ всего диапазона, все ячейки покупали разом
-        # в первую секунду (реальный SOL был на $75, а диапазон задали
-        # $140-160 — купились все 9 ячеек мгновенно, без единого честного
-        # "падения" цены). Теперь ячейка "взведена" на покупку, только если
-        # цена сейчас РЕАЛЬНО выше её линии покупки — иначе ждёт, пока цена
-        # сначала поднимется до этого уровня и только потом упадёт обратно.
         buy_line = lines[i]
         armed = (start_price is None) or (start_price > buy_line)
         cells.append({
@@ -1457,9 +1266,6 @@ async def check_grid(session, symbol: str):
                                             "side": "BUY", "price": price["ask"],
                                             "level": f"{cell['buy_line']}->{cell['sell_line']}"})
             elif not cell["armed"] and price["ask"] > cell["buy_line"]:
-                # Цена реально поднялась выше линии покупки — теперь
-                # честный "взвод": следующее падение до этой линии будет
-                # засчитано как настоящая покупка, не искусственный старт.
                 cell["armed"] = True
         elif cell["held"] and price["bid"] >= cell["sell_line"]:
             buy_price = cell["bought_at"]
@@ -1516,29 +1322,12 @@ async def grid_loop(session):
         await asyncio.sleep(5)
 
 
-# ══════════════════════════════════════════════════════════════
-# НОВОЕ 11.08: ФАНДИНГ-АРБИТРАЖ — тоже только симуляция/мониторинг,
-# та же гарантия безопасности. Используем ПУБЛИЧНЫЙ API Binance Futures
-# (без ключей) — там же, где обычный спот, только фьючерсный раздел.
-#
-# Логика позиции: лонг на споте + шорт на фьючерсе того же объёма —
-# ценовой риск взаимно гасится, прибыль — от выплат фандинга (обычно
-# каждые 8 часов). Здесь НЕ считаем реальные 8-часовые интервалы точно —
-# упрощённо начисляем ПРОПОРЦИОНАЛЬНО прошедшему времени по ТЕКУЩЕЙ
-# ставке на момент каждой проверки. Это оценка, не точный бухгалтерский
-# расчёт (реальная ставка меняется каждые 8 часов) — для учебных целей
-# этого достаточно, чтобы увидеть порядок величины дохода.
-# ══════════════════════════════════════════════════════════════
-
 GATE_FUTURES_BASE = "https://api.gateio.ws/api/v4"
-funding_positions: Dict[str, dict] = {}  # symbol -> состояние симуляции
-_funding_cache: dict = {"data": None, "ts": 0.0}  # общий кэш всех тикеров, живёт 15 сек
+funding_positions: Dict[str, dict] = {}
+_funding_cache: dict = {"data": None, "ts": 0.0}
 
 
 async def _fetch_gate_futures_tickers(session) -> List[dict]:
-    """Один запрос — сразу ВСЕ фьючерсы USDT с Gate.io, с funding_rate
-    в каждой записи. Кэшируем на 15 сек, чтобы /fundingtop и отдельные
-    /startfunding не дублировали один и тот же запрос подряд."""
     now = time.time()
     if _funding_cache["data"] is not None and now - _funding_cache["ts"] < 15:
         return _funding_cache["data"]
@@ -1556,17 +1345,10 @@ async def _fetch_gate_futures_tickers(session) -> List[dict]:
         return []
 
 
-_funding_interval_cache: Dict[str, int] = {}  # symbol -> интервал в секундах, кэш навсегда в рамках сессии
+_funding_interval_cache: Dict[str, int] = {}
 
 
 async def get_funding_interval_sec(session, symbol: str) -> int:
-    """НОВОЕ 11.08: реальный интервал выплат фандинга у КОНКРЕТНОГО
-    контракта — НЕ всегда 8 часов! Обнаружено на практике: история AI
-    показала интервалы ровно по 4 часа, а не 8, как у BTC. Gate.io прямо
-    документирует, что интервал варьируется между контрактами и может
-    даже временно меняться на 1 час при экстремальных ставках. Раньше
-    код везде считал фиксированные 8ч — для монет с более частыми
-    выплатами это ЗАНИЖАЛО оценку дохода вдвое (или больше)."""
     if symbol in _funding_interval_cache:
         return _funding_interval_cache[symbol]
     try:
@@ -1578,19 +1360,10 @@ async def get_funding_interval_sec(session, symbol: str) -> int:
             return interval
     except Exception as e:
         logger.error(f"Funding interval fetch {symbol}: {e}")
-        return 28800  # безопасный дефолт — стандартные 8ч, если не удалось узнать точно
+        return 28800
 
 
 async def get_funding_rate(session, symbol: str) -> Optional[dict]:
-    """ИСПРАВЛЕНИЕ 11.08 (раунд 2): Binance Futures (fapi.binance.com)
-    заблокирован для облачных IP (Railway попал под ту же раздачу, что и
-    множество облачных провайдеров). Первая попытка чинить — переключение
-    на Bybit — тоже не годится: в исходном коде УЖЕ был явный комментарий
-    "Bybit подтверждённо блокирует облачные IP через CloudFront (403)" —
-    эта проблема была найдена раньше и я её не заметил. Переключились на
-    Gate.io — тот же самый домен (api.gateio.ws), что уже подтверждённо
-    работает у вас для СПОТА в этом же файле, просто раздел /futures/
-    вместо /spot/."""
     tickers = await _fetch_gate_futures_tickers(session)
     contract = f"{symbol}_USDT"
     for item in tickers:
@@ -1612,7 +1385,6 @@ async def get_funding_rate(session, symbol: str) -> Optional[dict]:
 
 
 async def get_all_funding_rates(session) -> List[dict]:
-    """Все символы разом (USDT-контракты) — для /fundingtop."""
     tickers = await _fetch_gate_futures_tickers(session)
     out = []
     for item in tickers:
@@ -1633,13 +1405,6 @@ async def get_all_funding_rates(session) -> List[dict]:
 
 
 async def get_funding_rate_history(session, symbol: str, limit: int = 12) -> Optional[List[dict]]:
-    """НОВОЕ 11.08: история ставки фандинга — /fundinghistory. ВАЖНО:
-    точный формат полей этого конкретного эндпоинта (в отличие от
-    тикера, который уже проверен вживую) не подтверждён на практике —
-    пробуем оба вероятных варианта именования (полные "time"/"r" и
-    сокращённые "t"/"r"), логируем сырой ответ при неудаче, чтобы одним
-    взглядом в Railway-логи починить точно, если Gate.io назвал поля
-    иначе."""
     try:
         async with session.get(f"{GATE_FUTURES_BASE}/futures/usdt/funding_rate",
                                 params={"contract": f"{symbol}_USDT", "limit": limit},
@@ -1669,9 +1434,6 @@ async def get_funding_rate_history(session, symbol: str, limit: int = 12) -> Opt
 
 
 async def check_funding_position(session, symbol: str):
-    """Раз в цикл — узнаём ТЕКУЩУЮ ставку и начисляем пропорционально
-    времени, прошедшему с прошлой проверки (упрощённая, но честная по
-    порядку величины оценка)."""
     pos = funding_positions.get(symbol)
     if not pos:
         return
@@ -1686,11 +1448,6 @@ async def check_funding_position(session, symbol: str):
     pos["last_mark_price"] = info["mark_price"]
     pos["interval_hours"] = info["interval_hours"]
 
-    # ИСПРАВЛЕНИЕ 11.08: раньше здесь были жёстко зашитые 8 часов для
-    # ЛЮБОЙ монеты — обнаружено на практике (история AI показала интервал
-    # ровно 4ч, не 8), что это занижает оценку дохода вдвое для монет с
-    # более частыми выплатами. Теперь берём РЕАЛЬНЫЙ интервал конкретного
-    # контракта.
     accrued = pos["capital_usdt"] * info["rate"] * (elapsed_hours / info["interval_hours"])
     pos["accrued_usdt"] += accrued
     pos["checks"] += 1
@@ -1729,16 +1486,11 @@ async def funding_loop(session):
                 await check_funding_position(session, symbol)
         except Exception as e:
             logger.error(f"Funding loop error: {e}")
-        await asyncio.sleep(60)  # раз в минуту достаточно — ставка не скачет быстро
+        await asyncio.sleep(60)
 
 
 async def daily_digest_loop(session):
-    """НОВОЕ 12.08: раз в сутки — автоматический дайджест по всем активным
-    grid-сеткам и фандинг-позициям, без необходимости проверять вручную
-    каждый день. Задумано специально под многосуточное тестирование grid,
-    которое сейчас запускаем — чтобы просто читать одно сообщение в день,
-    а не заходить и вбивать команды."""
-    await asyncio.sleep(3600)  # первый отчёт через час после старта, не сразу
+    await asyncio.sleep(3600)
     while True:
         try:
             if CHAT_ID and (grids or funding_positions):
@@ -1765,7 +1517,54 @@ async def daily_digest_loop(session):
                 await send_tg(session, msg)
         except Exception as e:
             logger.error(f"Daily digest error: {e}")
-        await asyncio.sleep(86400)  # раз в сутки
+        await asyncio.sleep(86400)
+
+
+# НОВОЕ (по прямому запросу пользователя — "чтобы в автомате искал нужные
+# монеты на треугольный арбитраж на площадке KuCoin и MEXC"): фоновый цикл,
+# который сам, без ручного /triangle, регулярно сканирует ВСЕ монеты на
+# обеих биржах и уведомляет, если найдёт реальную возможность выше порога.
+#
+# Интервал НАМЕРЕННО больше, чем у основного скана (config["scan_interval"],
+# по умолчанию 6 сек) — один проход /triangle это ~660 запросов (2 биржи ×
+# ~108 монет × 3 пары), и делать это каждые несколько секунд рискует
+# упереться в ограничения скорости запросов (rate limit) обеих бирж.
+config["triangle_scan_interval_sec"] = 180  # раз в 3 минуты по умолчанию,
+    # настраивается командой /settriangleinterval
+TRIANGLE_SCAN_COOLDOWN_SEC = 600  # не спамить одной и той же находкой чаще раза в 10 минут
+_last_triangle_alert: Dict[Tuple[str, str, str], float] = {}
+
+
+async def triangle_scan_loop(session):
+    """Фоновый аналог /triangle — сканирует автоматически, на паузу
+    (глобальная кнопка) не завязан, т.к. это отдельная, независимая от
+    основного арбитражного скрининга функция без реальных сделок."""
+    await asyncio.sleep(45)  # даём боту время подняться, не сразу тяжёлый скан
+    while True:
+        try:
+            results = await scan_all_triangles(session)
+            now_ts = time.time()
+            fresh = []
+            for r in results:
+                key = (r["exchange"], r["symbol"], r["path"])
+                if now_ts - _last_triangle_alert.get(key, 0) < TRIANGLE_SCAN_COOLDOWN_SEC:
+                    continue
+                _last_triangle_alert[key] = now_ts
+                fresh.append(r)
+            if fresh and CHAT_ID:
+                msg = (f"🔺 *АВТО-НАЙДЕНО: треугольный арбитраж на "
+                       f"{', '.join(TRIANGLE_EXCHANGES)}!*\n━━━━━━━━━━━━━━━━━━━━━━\n\n")
+                for r in fresh[:10]:
+                    msg += (f"*{r['exchange']}* — {r['symbol']} via {r['path']}\n"
+                            f"   Чистая: `{r['net_pct']}%` | Профит на лот "
+                            f"(${config['lot_usdt']}): `{r['profit_usdt']} USDT`\n\n")
+                await send_tg(session, msg)
+            logger.info(f"Triangle auto-scan: {len(results)} возможностей выше порога "
+                         f"{config['min_profit_pct']}%, {len(fresh)} новых (не в кулдауне)")
+        except Exception as e:
+            stats["errors"] += 1
+            logger.error(f"Triangle scan loop error: {e}")
+        await asyncio.sleep(config.get("triangle_scan_interval_sec", 180))
 
 
 async def handle_command(session, text, chat_id):
@@ -1791,7 +1590,8 @@ async def handle_command(session, text, chat_id):
             f"*Главные команды:*\n"
             f"/verify МОНЕТА1 МОНЕТА2 ... — проверить кандидатов по-настоящему "
             f"(глубина стакана + совпадение цены между биржами, до 8 монет)\n"
-            f"/triangle — треугольный арбитраж на ВСЕХ биржах разом (новое!)\n"
+            f"/triangle — треугольный арбитраж по ВСЕМ {len(SYMBOLS)} монетам на "
+            f"{', '.join(TRIANGLE_EXCHANGES)} (без Binance)\n"
             f"/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ — учебный grid-симулятор (новое!)\n"
             f"/fundingtop — топ ставок фандинга на Gate.io Futures (новое!)\n"
             f"/startfunding СИМВОЛ КАПИТАЛ — симуляция фандинг-арбитража (новое!)\n"
@@ -1811,26 +1611,26 @@ async def handle_command(session, text, chat_id):
             f"/hours [БИРЖА1 БИРЖА2] — сигналы по часам UTC, можно с фильтром по маршруту (новое!)\n"
             f"/autoroutes — автоматический анализ узкого маршрута, сам присылает карточки (новое!)\n"
             f"/setprofit 0.15 — порог маржи | /setlot 100 — размер лота\n"
-            f"/addtriangle SYM /removetriangle SYM — список монет для /triangle\n"
         )
 
     elif cmd == "/triangle":
+        total_requests = len(TRIANGLE_EXCHANGES) * len(SYMBOLS) * 3
         await send_tg(session,
-            f"🔺 Сканирую треугольный арбитраж на ВСЕХ биржах "
-            f"({', '.join(ALL_EXCHANGES)}), монеты: {', '.join(TRIANGLE_SYMBOLS)}, "
-            f"мост: {TRIANGLE_BRIDGE}...")
+            f"🔺 Сканирую треугольный арбитраж на {', '.join(TRIANGLE_EXCHANGES)} "
+            f"по ВСЕМ {len(SYMBOLS)} монетам, мост: {TRIANGLE_BRIDGE} "
+            f"(~{total_requests} запросов, может занять 15-30 сек)...")
         results = await scan_all_triangles(session)
         if not results:
             await send_tg(session,
                 f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}% "
-                f"ни на одной из {len(ALL_EXCHANGES)} бирж прямо сейчас.\n"
+                f"ни на {', '.join(TRIANGLE_EXCHANGES)} прямо сейчас.\n"
                 f"(Либо пары ALT/{TRIANGLE_BRIDGE} не существуют для части монет на "
                 f"части бирж — это нормально, такие комбинации просто пропускаются.)\n\n"
                 f"Хочешь увидеть, насколько БЛИЗКО рынок подходил к порогу — "
                 f"`/triangletop` покажет лучшие результаты без фильтра."
             )
         else:
-            msg = (f"🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ — ВСЕ БИРЖИ*\n"
+            msg = (f"🔺 *ТРЕУГОЛЬНЫЙ АРБИТРАЖ — {', '.join(TRIANGLE_EXCHANGES)}*\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
             for r in results[:10]:
                 msg += (f"*{r['exchange']}* — {r['symbol']} via {r['path']}\n"
@@ -1840,8 +1640,10 @@ async def handle_command(session, text, chat_id):
 
     elif cmd == "/triangletop":
         await send_tg(session,
-            f"🔺 Сканирую БЕЗ ПОРОГА — показываю лучшие результаты, даже отрицательные, "
-            f"чтобы увидеть, насколько рынок реально близок к возможности...")
+            f"🔺 Сканирую БЕЗ ПОРОГА по всем {len(SYMBOLS)} монетам на "
+            f"{', '.join(TRIANGLE_EXCHANGES)} — показываю лучшие результаты, даже "
+            f"отрицательные, чтобы увидеть, насколько рынок реально близок к "
+            f"возможности (это может занять 15-30 сек)...")
         saved = config["min_profit_pct"]
         config["min_profit_pct"] = -999
         results = await scan_all_triangles(session)
@@ -1859,6 +1661,32 @@ async def handle_command(session, text, chat_id):
                     f"   Чистая: `{r['net_pct']}%`\n\n")
         await send_tg(session, msg)
 
+    elif cmd == "/settriangleinterval":
+        # НОВОЕ (по прямому запросу пользователя — автоматический фоновый
+        # поиск треугольника на KuCoin и MEXC): как часто фоновый цикл
+        # сам сканирует ВСЕ монеты, без ручного /triangle.
+        if len(parts) < 2:
+            cur = config.get("triangle_scan_interval_sec", 180)
+            await send_tg(session,
+                f"Текущий интервал автоматического сканирования треугольника: "
+                f"{cur} сек ({cur//60} мин)\n\n"
+                f"⚠️ Не рекомендуется ставить меньше 60 сек — один проход это "
+                f"~660 запросов к биржам (2 биржи × ~108 монет × 3 пары), "
+                f"слишком частый опрос рискует упереться в rate limit.\n\n"
+                f"Пример: `/settriangleinterval 120`"
+            )
+            return
+        try:
+            val = int(parts[1])
+            if val < 60:
+                await send_tg(session, "❌ Не менее 60 сек — иначе риск блокировки биржами "
+                                        "за слишком частые запросы.")
+                return
+            config["triangle_scan_interval_sec"] = val
+            await send_tg(session, f"✅ Интервал автосканирования треугольника: {val} сек")
+        except ValueError:
+            await send_tg(session, "❌ Пример: `/settriangleinterval 120`")
+
     elif cmd == "/fundingtop":
         await send_tg(session, "💸 Получаю ставки фандинга со всех фьючерсов Gate.io...")
         rates = await get_all_funding_rates(session)
@@ -1868,7 +1696,7 @@ async def handle_command(session, text, chat_id):
         rates.sort(key=lambda x: abs(x["rate"]), reverse=True)
         msg = "💸 *ТОП-20 СТАВОК ФАНДИНГА (Gate.io Futures)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for r in rates[:20]:
-            annual_pct = r["rate"] * 3 * 365 * 100  # грубая годовая экстраполяция
+            annual_pct = r["rate"] * 3 * 365 * 100
             icon = "🟢" if r["rate"] >= 0 else "🔴"
             msg += (f"{icon} *{r['symbol']}*: `{r['rate']*100:.4f}%`/8ч "
                     f"(~{annual_pct:.0f}% годовых при неизменной ставке)\n")
@@ -1889,7 +1717,6 @@ async def handle_command(session, text, chat_id):
             f"Аптайм бота: {h}ч {m}м\n\n"
         )
 
-        # --- 1. Обычный скрининг арбитража ---
         msg += (
             f"*1️⃣ Обычный арбитраж (скрининг)*\n"
             f"   Сканов: {stats['scans']} | Сигналов: {stats['signals']} | "
@@ -1897,14 +1724,13 @@ async def handle_command(session, text, chat_id):
             f"   Прибыль (сим., за всё время): `{round(stats['profit_sim'], 2)} USDT`\n\n"
         )
 
-        # --- 2. Треугольный арбитраж ---
         msg += (
             f"*2️⃣ Треугольный арбитраж*\n"
-            f"   Монет в списке: {len(TRIANGLE_SYMBOLS)} ({', '.join(TRIANGLE_SYMBOLS)})\n"
-            f"   Мост: {TRIANGLE_BRIDGE} | `/triangle` — проверить прямо сейчас\n\n"
+            f"   Монет в скане: {len(SYMBOLS)} (полный список)\n"
+            f"   Биржи: {', '.join(TRIANGLE_EXCHANGES)} | Мост: {TRIANGLE_BRIDGE}\n"
+            f"   `/triangle` — проверить прямо сейчас (займёт 15-30 сек)\n\n"
         )
 
-        # --- 3. Grid-сетки ---
         msg += f"*3️⃣ Grid-сетки* ({len(grids)} активных)\n"
         if not grids:
             msg += "   Нет активных сеток. `/startgrid СИМВОЛ НИЖЕ ВЫШЕ УРОВНЕЙ ЛОТ`\n\n"
@@ -1915,7 +1741,6 @@ async def handle_command(session, text, chat_id):
                         f"`{round(g['profit_usdt'],4)} USDT`, занято {held}/{len(g['cells'])} ячеек\n")
             msg += "\n"
 
-        # --- 4. Фандинг-позиции ---
         msg += f"*4️⃣ Фандинг-позиции* ({len(funding_positions)} активных)\n"
         if not funding_positions:
             msg += "   Нет активных позиций. `/startfunding СИМВОЛ КАПИТАЛ`\n"
@@ -1925,7 +1750,6 @@ async def handle_command(session, text, chat_id):
                 msg += (f"   *{sym}*: ставка `{rate:.4f}%`/8ч, накоплено "
                         f"`{round(pos['accrued_usdt'],4)} USDT` за {pos['checks']} проверок\n")
 
-        # --- 5. Автоанализ и боевой порог WorkerArbBot ---
         threshold = config.get('worker_honest_threshold_pct', 4.0)
         routes_str = ", ".join(f"{b}→{s}" for b, s in TARGET_ROUTES) or "(пусто)"
         suspicious_count = stats.get("auto_signal_suspicious_skipped", 0)
@@ -2115,31 +1939,6 @@ async def handle_command(session, text, chat_id):
             msg += f"*{sym}*: {g['low']}-{g['high']}, {g['trades']} сделок, {round(g['profit_usdt'],4)} USDT\n"
         await send_tg(session, msg)
 
-    elif cmd == "/addtriangle":
-        if len(parts) < 2:
-            await send_tg(session,
-                f"Добавляет монету в список для /triangle.\n"
-                f"Сейчас: {', '.join(TRIANGLE_SYMBOLS)}\n"
-                f"Пример: `/addtriangle MATIC`")
-            return
-        sym = parts[1].upper()
-        if sym in TRIANGLE_SYMBOLS:
-            await send_tg(session, f"⚠️ {sym} уже в списке треугольника.")
-            return
-        TRIANGLE_SYMBOLS.append(sym)
-        await send_tg(session, f"✅ Добавлено: {sym}\nСписок: {', '.join(TRIANGLE_SYMBOLS)}")
-
-    elif cmd == "/removetriangle":
-        if len(parts) < 2:
-            await send_tg(session, "Пример: `/removetriangle MATIC`")
-            return
-        sym = parts[1].upper()
-        if sym not in TRIANGLE_SYMBOLS:
-            await send_tg(session, f"⚠️ {sym} не в списке треугольника.")
-            return
-        TRIANGLE_SYMBOLS.remove(sym)
-        await send_tg(session, f"✅ Удалено: {sym}\nСписок: {', '.join(TRIANGLE_SYMBOLS) if TRIANGLE_SYMBOLS else '(пусто)'}")
-
     elif cmd == "/verify":
         if len(parts) < 2:
             await send_tg(session,
@@ -2321,13 +2120,6 @@ async def handle_command(session, text, chat_id):
         all_opps = find_arbitrage(all_data)
         config["min_profit_pct"] = saved_threshold
 
-        # ИЗМЕНЕНО (доработка 17.08): раньше топ-5 выбирался ТОЛЬКО по числу
-        # сигналов — там систематически доминируют крупные, высоколиквидные
-        # монеты (BNB, UNI, TAO), у которых сигналов много, а реального
-        # спреда почти никогда нет (эффективный рынок). Теперь сначала
-        # берём монеты, у которых ХОТЬ РАЗ была реальная сделка (trades>0),
-        # сортируя по P&L — это куда ближе к "что реально работает", чем
-        # "что часто мигает". Остаток топ-5 добираем как раньше.
         by_trades = sorted(
             [(c, cs) for c, cs in coin_stats.items() if cs["trades"] > 0],
             key=lambda kv: kv[1]["profit_usdt"], reverse=True
@@ -2384,11 +2176,6 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/leaderboard":
-        # НОВОЕ (доработка 17.08): опциональный фильтр по конкретному
-        # маршруту биржа→биржа — `/leaderboard KuCoin MEXC`. Без фильтра
-        # рейтинг агрегирует ВСЕ биржи разом, из-за чего монета может быть
-        # топ-1 благодаря совсем другому маршруту (не тому, что реально
-        # использует WorkerArbBot) — именно так и запутались с ONE/RVN.
         route_filter = None
         if len(parts) >= 3:
             buy_ex, sell_ex = parts[1], parts[2]
@@ -2412,14 +2199,6 @@ async def handle_command(session, text, chat_id):
                "сигналов — но перед добавлением в реальную торговлю каждого прогони через /verify)\n"
                "━━━━━━━━━━━━━━━━━━━━━━\n\n")
         for i, (sym, cs) in enumerate(ranked, 1):
-            # ИСПРАВЛЕНО 21.08: при фильтре по маршруту цифры ДОЛЖНЫ быть
-            # именно по этому маршруту (route_coin_stats), а не глобальные
-            # (coin_stats) — иначе получается тот самый баг, из-за которого
-            # RVN показывала 579 сделок/$1408 P&L в "/leaderboard KuCoin
-            # MEXC", хотя реально на этом маршруте было в разы меньше
-            # (сравни с честной /routecoins KuCoin MEXC, которую чинили
-            # ещё 17.08 — тут был тот же класс ошибки, просто в другой
-            # команде, упущенной тогда).
             if route_filter is not None:
                 display_stats = route_coin_stats.get((parts[1], parts[2], sym),
                                                         {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
@@ -2467,13 +2246,6 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, msg)
 
     elif cmd == "/routecoins":
-        # НОВОЕ (доработка 17.08): /routes показывает только топ-5 монет на
-        # маршрут ("и ещё 95") — этого недостаточно, чтобы найти реального
-        # кандидата для WorkerArbBot (у него маршрут ЖЁСТКО зашит в коде,
-        # напр. KuCoin→MEXC), приходится перебирать монеты руками. Эта
-        # команда даёт ПОЛНЫЙ список без обрезки, с сортировкой по тому,
-        # что реально работало (сделки > 0 и лучший P&L — выше), а не
-        # просто по алфавиту.
         if len(parts) < 3:
             await send_tg(session,
                 "Полный список монет с историей именно на этом маршруте (без обрезки "
@@ -2494,16 +2266,9 @@ async def handle_command(session, text, chat_id):
         rows = []
         for entry in rs["coins"]:
             sym = entry.split("/")[0]
-            # ИСПРАВЛЕНО (17.08): раньше здесь бралась ГЛОБАЛЬНАЯ coin_stats
-            # — одни и те же числа показывались для ЛЮБОГО маршрута, где
-            # монета вообще встречалась (баг, замеченный на практике: RVN и
-            # ONE показывали одинаковую "лучшую маржу" на двух разных
-            # парах бирж). Теперь берём статистику именно ЭТОГО маршрута.
             rcs = route_coin_stats.get((buy_ex, sell_ex, sym),
                                         {"signals": 0, "trades": 0, "profit_usdt": 0.0, "best_net_pct": 0.0})
             rows.append((entry, rcs["trades"], rcs["profit_usdt"], rcs["best_net_pct"]))
-        # Сортировка: сначала монеты с реальными сделками (по P&L), затем
-        # остальные — по лучшей когда-либо замеченной марже.
         rows.sort(key=lambda r: (r[1] > 0, r[2], r[3]), reverse=True)
 
         msg = (f"🪙 *ВСЕ МОНЕТЫ — {buy_ex} → {sell_ex}* ({len(rows)} шт)\n"
@@ -2564,20 +2329,12 @@ async def handle_command(session, text, chat_id):
             f"⚙️ Порог автоконвертации: {config['convert_threshold_usdt']} USDT\n"
             f"⚙️ Монет в скрининге: {len(SYMBOLS)}\n"
             f"⚙️ Валюты котировки: {', '.join(QUOTE_CURRENCIES)}\n"
-            f"⚙️ Бирж: {len(ALL_EXCHANGES)} ({'/'.join(ALL_EXCHANGES)})\n\n"
+            f"⚙️ Бирж: {len(ALL_EXCHANGES)} ({'/'.join(ALL_EXCHANGES)})\n"
+            f"⚙️ Треугольник: {len(SYMBOLS)} монет на {', '.join(TRIANGLE_EXCHANGES)}\n\n"
             f"/leaderboard — какие монеты реально сработали | /verify — проверить кандидатов по-настоящему"
         )
 
     elif cmd == "/hours":
-        # НОВОЕ (17.08): по запросу пользователя — после ~2 часов без
-        # единой правдоподобной возможности на 4 верифицированных биржах,
-        # понять есть ли часы суток активнее других. Считаем ОТДЕЛЬНО все
-        # сигналы и отдельно ПРАВДОПОДОБНЫЕ (< порога подозрительности) —
-        # иначе картину исказят HTX-артефакты вроде 18-21% "маржи".
-        # ДОБАВЛЕНО (17.08, раунд 2): опциональный фильтр по конкретному
-        # маршруту — `/hours KuCoin MEXC`. Без фильтра картина размазана
-        # по всем ~12 маршрутам разом, а для решения "когда включать
-        # WorkerArbBot" важна активность именно на ЕГО маршруте.
         if len(parts) >= 3:
             buy_ex, sell_ex = parts[1], parts[2]
             route_hour_data = [
@@ -2655,10 +2412,6 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Пример: `/setlot 100`")
 
     elif cmd == "/autoroutes":
-        # НОВОЕ: показать/управлять маршрутами для автоматического
-        # разбора (auto_signal_loop). По умолчанию — только KuCoin→MEXC,
-        # т.к. это единственный маршрут, который реально использует
-        # WorkerArbBot.
         routes_str = ", ".join(f"{b}→{s}" for b, s in TARGET_ROUTES) or "(пусто)"
         suspicious_count = stats.get("auto_signal_suspicious_skipped", 0)
         await send_tg(session,
@@ -2685,15 +2438,6 @@ async def handle_command(session, text, chat_id):
         )
 
     elif cmd == "/dexsearch":
-        # НОВОЕ (по прямому запросу пользователя "можем ли давать цену
-        # ЛЮБОЙ монеты автоматически"): вместо того чтобы молча выбирать
-        # "правильный" адрес самостоятельно — показывает ВСЕ найденные
-        # варианты с их ликвидностью. КРИТИЧНО: на BSC любой может создать
-        # токен с ЛЮБЫМ тикером/названием (token impersonation) — сегодня
-        # мы уже видели, что даже официальный мостовой токен ONE может
-        # быть почти неликвидным (99.65% расхождение с биржей). Автовыбор
-        # первого результата был бы небезопасен — решение остаётся за
-        # человеком, бот только помогает увидеть все варианты сразу.
         if len(parts) < 2:
             await send_tg(session,
                 "Ищет ВСЕ пулы в сети BSC, подходящие под запрос (обычно тикер) "
@@ -2738,12 +2482,6 @@ async def handle_command(session, text, chat_id):
 
 
     elif cmd == "/dexprice":
-        # НОВОЕ: честное сравнение CEX-цены (Binance/KuCoin/MEXC) с
-        # реальной DEX-ценой в сети BSC (через GeckoTerminal, лучший пул
-        # по ликвидности — обычно PancakeSwap, но не гарантированно) —
-        # чтобы проверить схему "купить на бирже → перевести на
-        # TrustWallet → продать через DEX-своп" ДО того, как рисковать
-        # реальными деньгами.
         if len(parts) < 2:
             known = ", ".join(BSC_TOKEN_ADDRESSES.keys())
             await send_tg(session,
@@ -2783,7 +2521,6 @@ async def handle_command(session, text, chat_id):
             )
             return
 
-        # Сверяем с лучшей CEX-ценой, если монета есть в основном списке скрининга
         cex_line = "_(монета не в списке CEX-скрининга — сравнение только с DEX-ценой)_"
         if symbol in SYMBOLS:
             all_data, active = await fetch_all(session)
@@ -2808,13 +2545,6 @@ async def handle_command(session, text, chat_id):
 
 
     elif cmd == "/routetrend":
-        # НОВОЕ: история спреда копится в фоне на КАЖДОЙ автопроверке
-        # (раз в config['auto_check_interval_sec']), даже если карточка не
-        # отправлялась (спред ниже порога или ещё нет 2 точек). Раньше
-        # тренд можно было увидеть только внутри уже пришедшей карточки —
-        # теперь можно посмотреть накопленную историю в любой момент, не
-        # дожидаясь новой карточки (полезно сразу после первого появления
-        # монеты, чтобы не ждать вслепую).
         if len(parts) < 2:
             await send_tg(session, "Пример: `/routetrend LRC`")
             return
@@ -2878,11 +2608,6 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Пример: `/setautothreshold 0.5`")
 
     elif cmd == "/setrealcoin":
-        # НОВОЕ: сообщить TrialArbBot, какая монета СЕЙЧАС реально
-        # торгуется в WorkerArbBot — используется для готовых команд
-        # переключения в зелёной карточке. Обновляй эту команду каждый
-        # раз, когда меняешь монету в рабочем боте вручную (боты не
-        # делятся памятью, это единственный способ синхронизации).
         if len(parts) < 2:
             await send_tg(session,
                 f"Текущая монета WorkerArbBot (по данным TrialArbBot): "
@@ -2894,9 +2619,6 @@ async def handle_command(session, text, chat_id):
         await send_tg(session, f"✅ Текущая монета WorkerArbBot: {config['current_real_coin']}")
 
     elif cmd == "/setworkerthreshold":
-        # НОВОЕ (18.08): синхронизация с БОЕВЫМ честным порогом WorkerArbBot
-        # (там он виден в /stats → «Порог... честный»). Обновляй здесь при
-        # каждом изменении — боты не делятся памятью.
         if len(parts) < 2:
             cur = config.get("worker_honest_threshold_pct", 4.0)
             await send_tg(session,
@@ -2917,9 +2639,6 @@ async def handle_command(session, text, chat_id):
             await send_tg(session, "❌ Пример: `/setworkerthreshold 4.06`")
 
     elif cmd == "/qualifiedsignals":
-        # НОВОЕ (18.08): лог сигналов, реально прошедших боевой порог
-        # WorkerArbBot — не общая статистика сигналов, а именно те
-        # моменты, когда была настоящая, проходная возможность.
         if not qualified_signals_log:
             await send_tg(session,
                 f"Пока ни одного сигнала не прошло боевой порог "
@@ -2941,7 +2660,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session,
             "/start /verify /scan /top /prices SYMBOL /depthcheck SYMBOL /exchanges\n"
             "/report /leaderboard /pairs /routes /balances\n"
-            "/stats /history /triangle /addtriangle /removetriangle\n"
+            "/stats /history /triangle /triangletop\n"
             "/setprofit 0.15 /setlot 100\n\n"
             "Это только монитор — реальных ордеров тут нет и не будет."
         )
@@ -2998,14 +2717,6 @@ async def scan_loop(session):
 
 
 def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
-    """Готовая карточка с разбором — то же самое, что мы вручную собирали
-    сегодня по ONE/XTZ: цены, чистый спред, тренд, историческая
-    статистика именно на этом узком маршруте, и явная рекомендация.
-    САМОДОСТАТОЧНА: глубина и аномальность уже проверены внутри
-    check_narrow_route (именно на ЭТИХ ДВУХ биржах, без Binance/третьих
-    бирж) — отдельный /verify запускать не нужно, он может ложно
-    отказать из-за отсутствия данных на бирже, которая вообще не
-    участвует в этом маршруте (как было с LRC 17.08)."""
     buy_ex, sell_ex, symbol = check["buy_ex"], check["sell_ex"], check["symbol"]
     net_pct = check["net_pct"]
     buy_ask_lv, buy_bid_lv = check.get("buy_levels", (0, 0))
@@ -3022,13 +2733,6 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
     verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
     verdict = verdict_obj["text"]
 
-    # НОВОЕ (по прямому запросу пользователя, 17.08): для зелёного вердикта
-    # сразу формируем готовый блок команд для копирования в WorkerArbBot —
-    # не нужно самому вспоминать порядок команд. ДОПОЛНИТЕЛЬНАЯ защита:
-    # даже при зелёном вердикте (минимум 3 точки истории) требуем ЕЩЁ
-    # больше данных (5+ точек) для самих команд — раз мы уже видели
-    # сегодня, как ONE переключался зелёный→жёлтый за одну проверку,
-    # 3 точки достаточно для вердикта, но маловато для реального решения.
     hist = route_symbol_spread_history.get((buy_ex, sell_ex, symbol), [])
     commands_block = ""
     if verdict_obj["level"] == "green":
@@ -3076,12 +2780,6 @@ def format_auto_signal(check: dict, trend: str, route_hist: dict) -> str:
 
 
 async def auto_signal_loop(session):
-    """НОВОЕ: фоновый автоматический разбор — раз в config['auto_check_
-    interval_sec'] проверяет всех кандидатов, засветившихся на целевых
-    маршрутах (TARGET_ROUTES), честным узким расчётом (не полагаясь на
-    зашумлённый общий /verify), копит историю спреда для тренда, и
-    присылает карточку только если спред выше config['auto_signal_min_pct']
-    и прошёл проверку глубины — с кулдауном, чтобы не спамить."""
     await asyncio.sleep(30)
     while True:
         try:
@@ -3095,9 +2793,6 @@ async def auto_signal_loop(session):
                     record_route_spread(buy_ex, sell_ex, symbol, check["net_pct"])
 
                     if check.get("suspicious"):
-                        # Аномально широкий спред даже между двумя целевыми
-                        # биржами (как RVN на MEXC 17.08) — не карточка, а
-                        # только счётчик, чтобы не спамить заведомым артефактом.
                         stats["auto_signal_suspicious_skipped"] = stats.get("auto_signal_suspicious_skipped", 0) + 1
                         continue
 
@@ -3117,9 +2812,6 @@ async def auto_signal_loop(session):
                         card_text = format_auto_signal(check, trend, route_hist)
                         verdict_obj = get_route_spread_verdict(buy_ex, sell_ex, symbol)
 
-                        # НОВОЕ (18.08): отдельно отмечаем и логируем сигналы,
-                        # которые реально прошли бы БОЕВОЙ порог WorkerArbBot
-                        # (не просто "не аномальный", а фактически проходной).
                         qualifies_real = check["net_pct"] >= config.get("worker_honest_threshold_pct", 4.0)
                         if qualifies_real:
                             qualified_signals_log.append({
@@ -3134,12 +2826,6 @@ async def auto_signal_loop(session):
                                 f"({config.get('worker_honest_threshold_pct', 4.0)}%)!*\n\n" + card_text
                             )
 
-                        # НОВОЕ: закрепляем только по-настоящему многообещающие
-                        # (зелёный вердикт) карточки — чтобы не потерялись среди
-                        # обычного потока сигналов сканера. Красные/жёлтые идут
-                        # обычным сообщением, без закрепления. Прошедшие боевой
-                        # порог закрепляем ВСЕГДА, даже если вердикт ещё не зелёный
-                        # (мало истории) — это самостоятельно значимая находка.
                         if verdict_obj["level"] == "green" or qualifies_real:
                             await send_tg_pinned(session, card_text)
                         else:
@@ -3159,7 +2845,7 @@ async def main():
         f"ArbScreenerBot (только мониторинг) | {len(SYMBOLS)} монет | {len(ALL_EXCHANGES)} бирж ({'/'.join(ALL_EXCHANGES)}) | "
         f"лот {config['lot_usdt']} USDT | порог {config['min_profit_pct']}% | "
         f"подозрительный спред >{SUSPICIOUS_SPREAD_PCT}% | мин. уровней стакана {MIN_DEPTH_LEVELS} | "
-        f"треугольник: {len(TRIANGLE_SYMBOLS)} монет через {TRIANGLE_BRIDGE}"
+        f"треугольник: {len(SYMBOLS)} монет на {', '.join(TRIANGLE_EXCHANGES)} через {TRIANGLE_BRIDGE}"
     )
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -3170,9 +2856,11 @@ async def main():
             funding_loop(session),
             daily_digest_loop(session),
             auto_signal_loop(session),
+            triangle_scan_loop(session),
             return_exceptions=True,
         )
-        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop", "daily_digest_loop", "auto_signal_loop"]
+        names = ["polling_loop", "scan_loop", "grid_loop", "funding_loop", "daily_digest_loop",
+                  "auto_signal_loop", "triangle_scan_loop"]
         for name, result in zip(names, results):
             if isinstance(result, Exception):
                 logger.error(f"Фоновая задача {name} упала с исключением: {result}")
