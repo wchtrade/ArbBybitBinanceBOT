@@ -1100,7 +1100,12 @@ async def execute_sim(opp: dict, session=None):
 # обратной совместимости (на случай, если где-то ещё используется имя).
 # ═══════════════════════════════════════════════════════════════
 TRIANGLE_SYMBOLS: List[str] = list(SYMBOLS)
-TRIANGLE_BRIDGE = "BTC"
+TRIANGLE_BRIDGE = "BTC"  # оставлено для обратной совместимости
+# НОВОЕ (по прямому запросу пользователя — "сделаем ко всем возможным
+# связкам"): теперь проверяются ОБА самых распространённых моста, не
+# только BTC. У части монет может не быть прямой пары к BTC, но быть
+# пара к ETH — раньше такие возможности вообще не проверялись.
+TRIANGLE_BRIDGES: List[str] = ["BTC", "ETH"]
 
 
 def fmt_pair(ex: str, base: str, quote: str) -> str:
@@ -1216,13 +1221,19 @@ async def scan_all_triangles(session) -> List[dict]:
     биржи): теперь запросы к каждой бирже проходят через семафор
     (calc_triangle_on_exchange_throttled), ограничивающий число
     одновременных запросов — весь объём выполняется, просто растянуто
-    во времени, не всплеском."""
+    во времени, не всплеском.
+
+    ИЗМЕНЕНО (по прямому запросу пользователя — "сделаем ко всем возможным
+    связкам"): теперь проверяются ОБА моста (BTC и ETH) для каждой монеты,
+    не только BTC — примерно вдвое больше запросов, но покрывает монеты,
+    у которых может не быть прямой пары к BTC, зато есть к ETH."""
     tasks = []
     for ex in TRIANGLE_EXCHANGES:
         for alt in SYMBOLS:
-            if alt == TRIANGLE_BRIDGE:
-                continue
-            tasks.append(calc_triangle_on_exchange_throttled(session, ex, alt, TRIANGLE_BRIDGE, config["lot_usdt"]))
+            for bridge in TRIANGLE_BRIDGES:
+                if alt == bridge:
+                    continue
+                tasks.append(calc_triangle_on_exchange_throttled(session, ex, alt, bridge, config["lot_usdt"]))
     results_nested = await asyncio.gather(*tasks, return_exceptions=True)
     found = []
     for r in results_nested:
@@ -1648,18 +1659,18 @@ async def handle_command(session, text, chat_id):
         )
 
     elif cmd == "/triangle":
-        total_requests = len(TRIANGLE_EXCHANGES) * len(SYMBOLS) * 3
+        total_requests = len(TRIANGLE_EXCHANGES) * len(SYMBOLS) * len(TRIANGLE_BRIDGES) * 3
         await send_tg(session,
             f"🔺 Сканирую треугольный арбитраж на {', '.join(TRIANGLE_EXCHANGES)} "
-            f"по ВСЕМ {len(SYMBOLS)} монетам, мост: {TRIANGLE_BRIDGE} "
-            f"(~{total_requests} запросов, может занять 15-30 сек)...")
+            f"по ВСЕМ {len(SYMBOLS)} монетам, мосты: {', '.join(TRIANGLE_BRIDGES)} "
+            f"(~{total_requests} запросов, может занять 20-40 сек)...")
         results = await scan_all_triangles(session)
         if not results:
             await send_tg(session,
                 f"😔 Нет треугольных возможностей выше порога {config['min_profit_pct']}% "
                 f"ни на {', '.join(TRIANGLE_EXCHANGES)} прямо сейчас.\n"
-                f"(Либо пары ALT/{TRIANGLE_BRIDGE} не существуют для части монет на "
-                f"части бирж — это нормально, такие комбинации просто пропускаются.)\n\n"
+                f"(Либо пары ALT/BTC и ALT/ETH не существуют для части "
+                f"монет на части бирж — это нормально, такие комбинации просто пропускаются.)\n\n"
                 f"Хочешь увидеть, насколько БЛИЗКО рынок подходил к порогу — "
                 f"`/triangletop` покажет лучшие результаты без фильтра."
             )
@@ -1785,7 +1796,7 @@ async def handle_command(session, text, chat_id):
         msg += (
             f"*2️⃣ Треугольный арбитраж*\n"
             f"   Монет в скане: {len(SYMBOLS)} (полный список)\n"
-            f"   Биржи: {', '.join(TRIANGLE_EXCHANGES)} | Мост: {TRIANGLE_BRIDGE}\n"
+            f"   Биржи: {', '.join(TRIANGLE_EXCHANGES)} | Мосты: {', '.join(TRIANGLE_BRIDGES)}\n"
             f"   `/triangle` — проверить прямо сейчас (займёт 15-30 сек)\n\n"
         )
 
@@ -2903,7 +2914,7 @@ async def main():
         f"ArbScreenerBot (только мониторинг) | {len(SYMBOLS)} монет | {len(ALL_EXCHANGES)} бирж ({'/'.join(ALL_EXCHANGES)}) | "
         f"лот {config['lot_usdt']} USDT | порог {config['min_profit_pct']}% | "
         f"подозрительный спред >{SUSPICIOUS_SPREAD_PCT}% | мин. уровней стакана {MIN_DEPTH_LEVELS} | "
-        f"треугольник: {len(SYMBOLS)} монет на {', '.join(TRIANGLE_EXCHANGES)} через {TRIANGLE_BRIDGE}"
+        f"треугольник: {len(SYMBOLS)} монет на {', '.join(TRIANGLE_EXCHANGES)} через {', '.join(TRIANGLE_BRIDGES)}"
     )
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
