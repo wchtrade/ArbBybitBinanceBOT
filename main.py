@@ -1721,6 +1721,30 @@ async def handle_command(session, text, chat_id):
         except ValueError:
             await send_tg(session, "❌ Пример: `/settriangleinterval 120`")
 
+    elif cmd == "/testmexcpair":
+        # НОВОЕ (по прямому запросу пользователя — найдено: MEXC всё ещё
+        # 0 находок даже после исправления семафора/статуса. Точечная
+        # проверка ОДНОЙ конкретной пары напрямую, чтобы увидеть РЕАЛЬНЫЙ
+        # ответ биржи — существует ли вообще эта пара, или дело в чём-то
+        # другом (например, MEXC просто не имеет ALT/BTC рынка для
+        # большинства этих монет, в отличие от KuCoin).
+        sym = parts[1].upper() if len(parts) > 1 else "ETH"
+        pair_symbol = f"{sym}BTC"
+        await send_tg(session, f"🔍 Прямой запрос к MEXC для пары {pair_symbol}...")
+        try:
+            async with session.get("https://api.mexc.com/api/v3/depth",
+                                    params={"symbol": pair_symbol, "limit": 10},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                status = r.status
+                body_text = await r.text()
+                await send_tg(session,
+                    f"📋 *Результат для {pair_symbol}:*\n"
+                    f"HTTP статус: `{status}`\n"
+                    f"Тело ответа (первые 500 симв.):\n`{body_text[:500]}`"
+                )
+        except Exception as e:
+            await send_tg(session, f"❌ Исключение при запросе: `{e}`")
+
     elif cmd == "/fundingtop":
         await send_tg(session, "💸 Получаю ставки фандинга со всех фьючерсов Gate.io...")
         rates = await get_all_funding_rates(session)
