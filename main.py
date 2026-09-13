@@ -562,10 +562,20 @@ async def get_orderbook_bitget(session, symbol: str):
 
 
 async def get_orderbook_mexc(session, symbol: str):
+    # ИСПРАВЛЕНО (по прямому запросу пользователя — найдено: MEXC ВООБЩЕ
+    # никогда не появлялся в находках треугольника, только KuCoin. Причина
+    # — эта функция никогда не проверяла код ответа HTTP! При всплеске
+    # ~650 одновременных запросов за один скан MEXC, скорее всего, отвечал
+    # ошибкой (429/лимит скорости) — тело ответа без полей bids/asks
+    # тихо интерпретировалось как "пустой стакан", а не как реальный сбой.
     try:
         async with session.get("https://api.mexc.com/api/v3/depth",
                                 params={"symbol": symbol, "limit": 100},
                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200:
+                body_preview = (await r.text())[:200]
+                logger.error(f"MEXC orderbook {symbol}: HTTP {r.status} — {body_preview}")
+                return None
             d = await r.json()
             bids = [[float(p), float(q)] for p, q in d.get("bids", [])]
             asks = [[float(p), float(q)] for p, q in d.get("asks", [])]
@@ -1170,6 +1180,29 @@ async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
     return found
 
 
+# НОВОЕ (по прямому запросу пользователя — найдена причина: MEXC никогда
+# не появлялся в находках треугольника, только KuCoin. Всплеск ~650
+# одновременных запросов, скорее всего, упирался в ограничение скорости
+# MEXC жёстче, чем у KuCoin). Семафор ограничивает число ОДНОВРЕМЕННЫХ
+# запросов К КАЖДОЙ бирже отдельно — не убирает общий объём работы,
+# но растягивает его во времени, снижая пиковую нагрузку на биржу.
+_exchange_semaphores: Dict[str, asyncio.Semaphore] = {
+    "KuCoin": asyncio.Semaphore(15),
+    "MEXC": asyncio.Semaphore(8),  # MEXC — более строгий лимит на основе находки
+}
+
+
+async def calc_triangle_on_exchange_throttled(session, ex: str, alt: str, bridge: str,
+                                                lot_usdt: float) -> List[dict]:
+    """Обёртка вокруг calc_triangle_on_exchange с ограничением скорости
+    запросов к конкретной бирже через семафор."""
+    sem = _exchange_semaphores.get(ex)
+    if sem:
+        async with sem:
+            return await calc_triangle_on_exchange(session, ex, alt, bridge, lot_usdt)
+    return await calc_triangle_on_exchange(session, ex, alt, bridge, lot_usdt)
+
+
 async def scan_all_triangles(session) -> List[dict]:
     """ИЗМЕНЕНО (по прямому запросу пользователя — треугольник по ВСЕМ
     монетам, только KuCoin и MEXC): раньше проверялся маленький список
@@ -1178,17 +1211,18 @@ async def scan_all_triangles(session) -> List[dict]:
     заблокирован по API на территории пользователя, и не нужен для этой
     схемы, работающей внутри одной биржи).
 
-    ВНИМАНИЕ: это ~660 запросов за один вызов (2 биржи × ~108 монет × 3
-    пары) — заметно больше, чем раньше (~70). Разумно для разовой,
-    ручной команды /triangle, но НЕ рекомендуется запускать это часто
-    в фоновом автоматическом цикле — риск упереться в ограничения
-    скорости запросов (rate limit) бирж."""
+    ИСПРАВЛЕНО (по прямому запросу пользователя — найдено: MEXC никогда
+    не появлялся в находках, всплеск запросов упирался в лимит скорости
+    биржи): теперь запросы к каждой бирже проходят через семафор
+    (calc_triangle_on_exchange_throttled), ограничивающий число
+    одновременных запросов — весь объём выполняется, просто растянуто
+    во времени, не всплеском."""
     tasks = []
     for ex in TRIANGLE_EXCHANGES:
         for alt in SYMBOLS:
             if alt == TRIANGLE_BRIDGE:
                 continue
-            tasks.append(calc_triangle_on_exchange(session, ex, alt, TRIANGLE_BRIDGE, config["lot_usdt"]))
+            tasks.append(calc_triangle_on_exchange_throttled(session, ex, alt, TRIANGLE_BRIDGE, config["lot_usdt"]))
     results_nested = await asyncio.gather(*tasks, return_exceptions=True)
     found = []
     for r in results_nested:
