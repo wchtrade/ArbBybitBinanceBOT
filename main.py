@@ -603,7 +603,10 @@ ALL_EXCHANGES = ["Binance", "KuCoin", "MEXC"]
 # на территории пользователя, к тому же не нужен для этой конкретной
 # схемы — треугольник происходит внутри одной биржи, KuCoin/MEXC уже
 # используются в основной реальной торговле).
-TRIANGLE_EXCHANGES = ["KuCoin", "MEXC"]
+TRIANGLE_EXCHANGES = ["KuCoin", "MEXC", "HTX"]  # НОВОЕ (по прямому запросу
+    # пользователя — "добавим HTX как третью биржу"): раз KuCoin/MEXC не
+    # дают реальных возможностей за 10+ часов наблюдения, расширяем поиск
+    # на третью биржу с потенциально другой динамикой ликвидности.
 
 BSC_TOKEN_ADDRESSES = {
     "USDT": "0x55d398326f99059fF775485246999027B3197955",
@@ -1197,6 +1200,8 @@ async def calc_triangle_on_exchange(session, ex: str, alt: str, bridge: str,
 _exchange_semaphores: Dict[str, asyncio.Semaphore] = {
     "KuCoin": asyncio.Semaphore(15),
     "MEXC": asyncio.Semaphore(8),  # MEXC — более строгий лимит на основе находки
+    "HTX": asyncio.Semaphore(6),  # НОВОЕ: HTX ранее не тестировалась в этом
+        # режиме — консервативный лимит, раз реальный лимит скорости неизвестен.
 }
 
 
@@ -1577,11 +1582,10 @@ async def daily_digest_loop(session):
 # по умолчанию 6 сек) — один проход /triangle это ~660 запросов (2 биржи ×
 # ~108 монет × 3 пары), и делать это каждые несколько секунд рискует
 # упереться в ограничения скорости запросов (rate limit) обеих бирж.
-config["triangle_scan_interval_sec"] = 300  # ИЗМЕНЕНО (по прямому запросу
-    # пользователя — "добавим все мосты, но так, чтобы не блокировали"):
-    # с тремя мостами (BTC/ETH/USDC) объём вырос до ~1944 запросов за
-    # скан — увеличен интервал по умолчанию с 180 до 300 сек (5 минут)
-    # для дополнительного запаса безопасности.
+config["triangle_scan_interval_sec"] = 420  # ИЗМЕНЕНО (по прямому запросу
+    # пользователя — "добавим HTX как третью биржу"): объём вырос до
+    # ~2916 запросов за скан (было 1944 с двумя биржами) — интервал
+    # увеличен с 300 до 420 сек (7 минут) для дополнительного запаса.
     # настраивается командой /settriangleinterval
 TRIANGLE_SCAN_COOLDOWN_SEC = 600  # не спамить одной и той же находкой чаще раза в 10 минут
 _last_triangle_alert: Dict[Tuple[str, str, str], float] = {}
@@ -1670,7 +1674,7 @@ async def handle_command(session, text, chat_id):
         await send_tg(session,
             f"🔺 Сканирую треугольный арбитраж на {', '.join(TRIANGLE_EXCHANGES)} "
             f"по ВСЕМ {len(SYMBOLS)} монетам, мосты: {', '.join(TRIANGLE_BRIDGES)} "
-            f"(~{total_requests} запросов, может занять 20-40 сек)...")
+            f"(~{total_requests} запросов, может занять 30-60 сек)...")
         results = await scan_all_triangles(session)
         if not results:
             await send_tg(session,
